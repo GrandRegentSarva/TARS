@@ -1,0 +1,44 @@
+# =============================================================================
+# TARS .gitignore
+# =============================================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables (may contain secrets in later phases)
+.env
+
+# Output files (telemetry data -- can be large)
+output/*.json
+output/*.jsonl
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+docker/.env
+
+# Logs
+*.log
