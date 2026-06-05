@@ -1,0 +1,53 @@
+# =============================================================================
+# TARS Phase 1 -- PX4 SITL + Gazebo Headless
+# =============================================================================
+# This Dockerfile builds a container that runs PX4 autopilot firmware in
+# Software-In-The-Loop (SITL) mode with Gazebo simulator running headless
+# (no GUI rendering).
+#
+# What's happening here:
+#   1. We start from PX4's official simulation image (Ubuntu 22.04 based)
+#   2. We clone the PX4-Autopilot source code
+#   3. We build the SITL target (compiles PX4 firmware for your CPU, not drone hardware)
+#   4. At runtime, PX4 launches with Gazebo in headless mode
+#
+# Key ports exposed:
+#   - 14540: MAVSDK/offboard API (your Python scripts connect here)
+#   - 14550: QGroundControl (ground station connects here)
+# =============================================================================
+
+FROM px4io/px4-dev-simulation-jammy:latest
+
+# Avoid interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Set the PX4 home directory
+ENV PX4_HOME=/root/PX4-Autopilot
+
+# Clone PX4-Autopilot source code
+# We use --recursive because PX4 has many git submodules (Gazebo models, MAVLink definitions, etc.)
+# --depth 1 keeps only the latest commit to save disk space (~2GB instead of ~8GB)
+RUN git clone --recursive --depth 1 --branch v1.15.4 \
+    https://github.com/PX4/PX4-Autopilot.git ${PX4_HOME}
+
+# Set working directory to PX4 source
+WORKDIR ${PX4_HOME}
+
+# Build PX4 SITL with Gazebo Classic (gz = gazebo classic target)
+# This compiles the PX4 firmware to run on your CPU instead of on a flight controller chip
+# 'make px4_sitl gazebo-classic' builds both PX4 and the Gazebo plugin that connects them
+RUN make px4_sitl gazebo-classic
+
+# Headless mode -- tells Gazebo not to start its 3D GUI
+# This saves ~1GB RAM and avoids needing GPU passthrough in Docker
+ENV HEADLESS=1
+
+# PX4 SITL broadcasts MAVLink on these UDP ports
+# 14540 = offboard API (MAVSDK connects here)
+# 14550 = QGroundControl (ground station connects here)
+EXPOSE 14540/udp
+EXPOSE 14550/udp
+
+# Default command: launch PX4 SITL with Gazebo Classic
+# 'make px4_sitl gazebo-classic' starts both PX4 and Gazebo, connected via shared memory
+CMD ["make", "px4_sitl", "gazebo-classic"]

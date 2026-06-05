@@ -1,0 +1,53 @@
+# =============================================================================
+# TARS Phase 1 -- Docker Compose for PX4 SITL + Gazebo Headless
+# =============================================================================
+# Usage:
+#   docker compose up        -- Start PX4 SITL + Gazebo headless
+#   docker compose up -d     -- Start in background (detached)
+#   docker compose down      -- Stop and remove containers
+#   docker compose logs -f   -- Follow logs
+#
+# What this does:
+#   Launches a single container running PX4 autopilot firmware in simulation mode.
+#   Gazebo runs headless (no 3D GUI) to save RAM on your i3 ThinkPad.
+#   MAVLink is exposed on UDP ports 14540 (MAVSDK) and 14550 (QGroundControl).
+#
+# Network mode: host
+#   We use host networking because PX4 SITL uses UDP multicast/broadcast
+#   for MAVLink communication. Bridge networking would require complex
+#   port forwarding rules. Host mode = "container shares the host's network"
+#   so your Python scripts and QGroundControl connect as if PX4 is running locally.
+# =============================================================================
+
+services:
+  px4-sitl:
+    build:
+      context: .
+      dockerfile: Dockerfile.px4-sitl
+    container_name: tars-px4-sitl
+    
+    # Host networking -- simplest way to expose MAVLink UDP ports
+    # PX4 SITL broadcasts on 14540 and 14550, and with host networking
+    # your host machine can receive these broadcasts directly
+    network_mode: host
+    
+    # Environment variables
+    environment:
+      # HEADLESS=1 tells Gazebo to skip 3D rendering (saves ~1GB RAM)
+      - HEADLESS=1
+      # PX4_HOME is where the PX4 source code lives inside the container
+      - PX4_HOME=/root/PX4-Autopilot
+    
+    # Resource limits -- important for your 8GB RAM system
+    # Prevents the container from consuming all available memory
+    deploy:
+      resources:
+        limits:
+          memory: 3g    # Cap at 3GB (leaves ~4GB for host + Python + QGC)
+          cpus: "3"     # Use up to 3 of your 4 threads
+    
+    # Restart policy -- if PX4 crashes, restart it automatically
+    restart: unless-stopped
+    
+    # Privileged mode needed for some PX4 SITL operations
+    privileged: true
