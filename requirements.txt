@@ -1,0 +1,22 @@
+# =============================================================================
+# TARS Phase 1 -- Python Dependencies
+# =============================================================================
+# Install with: pip install -r requirements.txt
+#
+# We keep dependencies minimal for Phase 1.
+# Later phases will add FastAPI, SQLAlchemy, google-genai, phoenix, etc.
+# =============================================================================
+
+# MAVSDK -- Python SDK for MAVLink drone communication
+# This is how your Python code talks to PX4 autopilot
+# It uses gRPC internally to communicate with a MAVSDK server process
+mavsdk>=2.0.0
+
+# Pydantic -- Data validation and JSON serialization
+# We use this to define strict telemetry data models
+# Ensures every telemetry snapshot has the right structure
+pydantic>=2.0.0
+
+# python-dotenv -- Load .env files into environment variables
+# Reads PX4_CONNECTION, TELEMETRY_RATE_HZ, etc. from .env file
+python-dotenv>=1.0.0
