@@ -14,18 +14,29 @@ Built with: PX4, Gazebo, MAVSDK, Python (future: Gemini, Phoenix, Neo4j)
 
 ---
 
-## Current Status: Phase 1 -- Mission Foundation
+## Current Status: Phase 2 -- Mission Replay System
 
-Phase 1 proves that telemetry exists. A simulated drone flies autonomous missions while structured telemetry is collected and faults are injected.
+Phase 2 makes telemetry reusable. Missions are imported from Phase 1 JSON files into PostgreSQL, then queried and replayed through a FastAPI REST API.
 
 ### What's Working
 
+**Phase 1 -- Mission Foundation:**
 - [x] PX4 SITL + Gazebo headless simulation (Docker)
 - [x] MAVSDK async telemetry collection (position, battery, GPS, attitude, health)
 - [x] Autonomous mission execution (takeoff -> waypoints -> land)
 - [x] Fault injection (GPS block, GPS noise, battery drain, baro offset, mag offset)
 - [x] Structured JSON telemetry output with Pydantic models
 - [x] Pre-built fault scenarios (GPS degradation, altitude confusion, sensor cascade)
+
+**Phase 2 -- Mission Replay System:**
+- [x] PostgreSQL mission store (Docker Compose)
+- [x] Alembic database migrations
+- [x] Mission import from Phase 1 JSON (validated through MissionTelemetry model)
+- [x] Idempotent import with overwrite control
+- [x] FastAPI REST API (mission listing, detail, events, replay)
+- [x] Ordered replay frames with elapsed timing metadata
+- [x] Fault event persistence and retrieval
+- [x] Tests for importer, replay, and API endpoints
 
 ---
 
@@ -74,6 +85,9 @@ pip install -r requirements.txt
 
 # Or with a custom mission ID
 MISSION_ID=my_first_mission ./scripts/run_mission.sh
+
+# Run a mission with a fault scenario (faults recorded in output JSON)
+FAULT_SCENARIO=s1 ./scripts/run_mission.sh
 ```
 
 ### 4. View the Output
@@ -90,7 +104,7 @@ cat output/mission_*.json | python3 -m json.tool | head -50
 . .venv/bin/activate
 
 # Interactive fault injection while a mission is running
-.venv/bin/python3 -m src.phase1.fault_injector
+PYTHONPATH=src .venv/bin/python3 -m tars.phase1.fault_injector
 ```
 
 ### 6. Stop the Simulation
@@ -105,25 +119,114 @@ cat output/mission_*.json | python3 -m json.tool | head -50
 
 ```
 TARS/
-|-- plans/                          # Architecture and planning docs
-|   +-- phase-1-mission-foundation.md
-|-- docker/                         # Docker setup
-|   |-- Dockerfile.px4-sitl         # PX4 SITL + Gazebo headless
-|   +-- docker-compose.yml          # Container orchestration
+|-- plans/                              # Architecture and planning docs
+|   |-- phase-1-mission-foundation.md
+|   +-- phase-2-mission-replay-system.md
+|-- docker/                             # Docker setup
+|   |-- Dockerfile.px4-sitl             # PX4 SITL + Gazebo headless
+|   +-- docker-compose.yml              # PX4 SITL + PostgreSQL
 |-- src/
-|   +-- phase1/
-|       |-- telemetry_collector.py  # Async telemetry streaming via MAVSDK
-|       |-- mission_runner.py       # Autonomous mission execution
-|       |-- fault_injector.py       # Fault injection + scenarios
-|       +-- models/
-|           +-- telemetry.py        # Pydantic data models
+|   +-- tars/
+|       |-- phase1/                     # Phase 1 -- Mission Foundation
+|       |   |-- telemetry_collector.py  # Async telemetry streaming via MAVSDK
+|       |   |-- mission_runner.py       # Autonomous mission execution
+|       |   |-- fault_injector.py       # Fault injection + scenarios
+|       |   +-- models/
+|       |       +-- telemetry.py        # Pydantic data models
+|       +-- phase2/                     # Phase 2 -- Mission Replay System
+|           |-- api.py                  # FastAPI app and routes
+|           |-- config.py              # Environment settings
+|           |-- database.py            # Async SQLAlchemy engine/session
+|           |-- importer.py            # Phase 1 JSON import + validation
+|           |-- replay.py              # Replay frame construction
+|           |-- service.py             # Mission query orchestration
+|           +-- models/
+|               |-- db.py              # SQLAlchemy ORM tables
+|               +-- schemas.py         # API request/response schemas
+|-- migrations/                         # Alembic database migrations
+|   |-- env.py
+|   +-- versions/
 |-- scripts/
-|   |-- start_simulation.sh         # Launch/stop simulation
-|   +-- run_mission.sh              # Run a mission
-|-- output/                         # Telemetry JSON files
-|-- requirements.txt                # Python dependencies
-|-- .env.example                    # Configuration template
+|   |-- start_simulation.sh             # Launch/stop PX4 simulation
+|   |-- run_mission.sh                  # Run a Phase 1 mission
+|   |-- start_replay_api.sh             # Start Phase 2 API server
+|   +-- import_mission.sh               # Import mission JSON via API
+|-- tests/
+|   +-- phase2/                         # Phase 2 tests
+|       |-- test_importer.py
+|       |-- test_replay.py
+|       +-- test_api.py
+|-- output/                             # Telemetry JSON files
+|-- alembic.ini                         # Alembic configuration
+|-- pytest.ini                          # Pytest configuration
+|-- requirements.txt                    # Python dependencies
+|-- .env.example                        # Configuration template
 +-- README.md
+```
+
+---
+
+## Phase 2 -- Mission Replay System
+
+Phase 2 runs independently of PX4/Gazebo. You only need PostgreSQL and the Phase 2 API.
+
+### 1. Start PostgreSQL
+
+```bash
+docker compose -f docker/docker-compose.yml up postgres -d
+```
+
+### 2. Run Database Migrations
+
+```bash
+PYTHONPATH=src .venv/bin/alembic upgrade head
+```
+
+### 3. Start the Replay API
+
+```bash
+./scripts/start_replay_api.sh
+
+# API docs available at http://localhost:8000/docs
+# Health check at http://localhost:8000/health
+```
+
+### 4. Import a Mission
+
+```bash
+# Via the script (requires API running)
+./scripts/import_mission.sh output/mission_20260608_120000.json
+
+# Or via curl
+curl -X POST http://localhost:8000/api/v1/missions/import \
+  -H "Content-Type: application/json" \
+  -d '{"path": "output/mission_20260608_120000.json", "overwrite": false}'
+```
+
+### 5. Query Missions
+
+```bash
+# List all missions
+curl http://localhost:8000/api/v1/missions
+
+# Get mission detail (includes faults)
+curl http://localhost:8000/api/v1/missions/mission_20260608_120000
+
+# Get telemetry events
+curl http://localhost:8000/api/v1/missions/mission_20260608_120000/events
+
+# Replay a mission
+curl http://localhost:8000/api/v1/missions/mission_20260608_120000/replay
+
+# Replay with time range
+curl "http://localhost:8000/api/v1/missions/mission_20260608_120000/replay?from_ms=5000&to_ms=30000"
+```
+
+### 6. Run Tests
+
+```bash
+# Requires PostgreSQL running
+PYTHONPATH=src .venv/bin/pytest tests/phase2/ -v
 ```
 
 ---
@@ -191,7 +294,7 @@ Each mission produces a JSON file in `output/`:
 ### Interactive Mode
 
 ```bash
-.venv/bin/python3 -m src.phase1.fault_injector
+PYTHONPATH=src .venv/bin/python3 -m tars.phase1.fault_injector
 ```
 
 Available commands:
@@ -202,7 +305,8 @@ Available commands:
 | `3` | Battery Drain | Accelerated battery discharge |
 | `4` | Baro Offset | Incorrect altitude readings |
 | `5` | Mag Offset | Corrupted compass heading |
-| `6` | Restore All | Remove all injected faults |
+| `6` | Wind | 8 m/s wind from north with moderate turbulence |
+| `7` | Restore All | Remove all injected faults |
 
 ### Pre-built Scenarios
 
@@ -211,12 +315,15 @@ Available commands:
 | `s1` -- GPS Degradation | NASA Ingenuity | Progressive GPS noise -> block |
 | `s2` -- Altitude Confusion | Amazon MK30 | Conflicting altitude sensors |
 | `s3` -- Sensor Cascade | Bell 525 | Multiple sensors fail simultaneously |
+| `s4` -- Wind Shear | Drone delivery incidents | Progressive crosswind -> severe gust |
 
 ---
 
 ## Configuration
 
 Edit `.env` or set environment variables:
+
+### Phase 1
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -225,6 +332,15 @@ Edit `.env` or set environment variables:
 | `DRONE_ID` | `tars-sim-01` | Drone identifier |
 | `OUTPUT_DIR` | `output` | Telemetry output directory |
 | `MISSION_ID` | auto-generated | Mission identifier |
+| `FAULT_SCENARIO` | *(none)* | Run a fault scenario during the mission (`s1`–`s4`) |
+
+### Phase 2
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABASE_URL` | `postgresql+asyncpg://tars:tars@localhost:5432/tars` | PostgreSQL connection string |
+| `API_HOST` | `0.0.0.0` | FastAPI server host |
+| `API_PORT` | `8000` | FastAPI server port |
 
 ---
 
@@ -244,9 +360,9 @@ Gazebo runs in **headless mode** (no 3D rendering) to fit within RAM constraints
 
 | Phase | Name | Status |
 |-------|------|--------|
-| 1 | Mission Foundation (PX4 + Gazebo + MAVSDK) | Current |
-| 2 | Mission Replay System (FastAPI + PostgreSQL) | Next |
-| 3 | State Engine (Python + Redis) | Planned |
+| 1 | Mission Foundation (PX4 + Gazebo + MAVSDK) | ✅ Done |
+| 2 | Mission Replay System (FastAPI + PostgreSQL) | ✅ Current |
+| 3 | State Engine (Python + Redis) | Next |
 | 4 | Incident Engine (Rules + Statistical Detection) | Planned |
 | 5 | Gemini Reasoning Layer (Google ADK) | Planned |
 | 6 | Phoenix Integration (OpenInference Tracing) | Planned |
