@@ -19,10 +19,10 @@ Available fault types:
 
 Usage:
     # Standalone -- inject faults interactively
-    python -m src.phase1.fault_injector
+    python -m tars.phase1.fault_injector
 
     # As a module -- use in mission scripts
-    from src.phase1.fault_injector import FaultInjector
+    from tars.phase1.fault_injector import FaultInjector
     injector = FaultInjector(drone)
     await injector.inject_gps_block()
 """
@@ -336,6 +336,75 @@ class FaultInjector:
         await self._set_param_float("SIM_MAG_OFFSET_Z", 0.0)
 
     # =========================================================================
+    # Wind Faults
+    # =========================================================================
+
+    async def inject_wind(
+        self,
+        speed_m_s: float = 8.0,
+        direction_deg: float = 0.0,
+        turbulence: float = 3.0,
+    ):
+        """
+        Inject wind into the simulation environment.
+
+        Args:
+            speed_m_s: Steady-state wind speed in m/s.
+                       5.0  = moderate breeze (leaves and small branches move)
+                       8.0  = fresh breeze (small trees sway, whitecaps on water)
+                       12.0 = strong breeze (large branches move, difficult to fly)
+                       20.0 = gale force (dangerous for most drones)
+            direction_deg: Wind direction in degrees (0=North, 90=East, 180=South, 270=West).
+                           This is the direction the wind is COMING FROM (meteorological convention).
+            turbulence: Turbulence intensity in m/s (random variation around steady speed).
+                        0.0 = perfectly steady wind
+                        3.0 = moderate gusts
+                        6.0 = severe turbulence
+
+        What happens:
+        - PX4 SITL parameters SIM_WIND_SPD, SIM_WIND_DIR, and SIM_WIND_TURB
+          configure the simulated wind environment
+        - The drone experiences aerodynamic forces pushing it off course
+        - PX4's position controller compensates by tilting into the wind
+        - Attitude (roll/pitch) changes become visible in telemetry
+        - If wind exceeds the drone's thrust capability, it drifts uncontrollably
+
+        Real-world equivalent:
+        - Sudden weather changes during flight
+        - Flying near buildings that create wind tunnels
+        - Mountain/valley wind effects (katabatic winds)
+        - Rotor downwash from nearby helicopters
+
+        PX4 SITL wind parameters:
+        - SIM_WIND_SPD: Steady wind speed (m/s)
+        - SIM_WIND_DIR: Wind direction (degrees, 0=North)
+        - SIM_WIND_TURB: Turbulence intensity (m/s)
+        """
+        logger.warning(
+            f"INJECTING FAULT: Wind "
+            f"(speed={speed_m_s} m/s, dir={direction_deg}°, turb={turbulence} m/s)"
+        )
+        await self._set_param_float("SIM_WIND_SPD", speed_m_s)
+        await self._set_param_float("SIM_WIND_DIR", direction_deg)
+        await self._set_param_float("SIM_WIND_TURB", turbulence)
+        self._record_fault(
+            FaultType.WIND_GUST,
+            {
+                "SIM_WIND_SPD": speed_m_s,
+                "SIM_WIND_DIR": direction_deg,
+                "SIM_WIND_TURB": turbulence,
+            },
+            f"Wind injected -- {speed_m_s} m/s from {direction_deg}° with {turbulence} m/s turbulence",
+        )
+
+    async def restore_wind(self):
+        """Remove wind from the simulation."""
+        logger.info("RESTORING: Wind removed")
+        await self._set_param_float("SIM_WIND_SPD", 0.0)
+        await self._set_param_float("SIM_WIND_DIR", 0.0)
+        await self._set_param_float("SIM_WIND_TURB", 0.0)
+
+    # =========================================================================
     # Restore All
     # =========================================================================
 
@@ -353,6 +422,7 @@ class FaultInjector:
         await self.restore_battery()
         await self.restore_baro()
         await self.restore_mag()
+        await self.restore_wind()
         logger.info("All parameters restored")
 
 
@@ -450,6 +520,37 @@ class FaultScenarios:
         logger.info("   Phase 3: Adding barometer offset")
         await self.injector.inject_baro_offset(8.0)
 
+    async def scenario_wind_shear(self, delay_seconds: float = 15.0):
+        """
+        Progressive wind shear scenario.
+
+        Timeline:
+        1. Start with calm conditions
+        2. After delay: moderate crosswind
+        3. After 10s: wind intensifies with turbulence
+        4. After 10s: severe gust from opposite direction
+
+        Inspired by: Numerous drone delivery incidents where sudden
+        weather changes caused loss of control during approach/landing.
+        """
+        logger.info("SCENARIO: Wind Shear")
+        logger.info(f"   Starting in {delay_seconds}s...")
+
+        await asyncio.sleep(delay_seconds)
+
+        logger.info("   Phase 1: Moderate crosswind from east")
+        await self.injector.inject_wind(speed_m_s=5.0, direction_deg=90.0, turbulence=1.0)
+
+        await asyncio.sleep(10)
+
+        logger.info("   Phase 2: Wind intensifies with turbulence")
+        await self.injector.inject_wind(speed_m_s=10.0, direction_deg=90.0, turbulence=4.0)
+
+        await asyncio.sleep(10)
+
+        logger.info("   Phase 3: Severe gust from opposite direction")
+        await self.injector.inject_wind(speed_m_s=15.0, direction_deg=270.0, turbulence=6.0)
+
 
 # =============================================================================
 # Standalone Mode -- Interactive fault injection for testing
@@ -462,7 +563,7 @@ async def main():
     Connects to PX4 SITL and lets you inject faults manually.
     Useful for testing while a mission is running in another terminal.
 
-    Usage: python -m src.phase1.fault_injector
+    Usage: python -m tars.phase1.fault_injector
     """
     connection_str = os.getenv("PX4_CONNECTION", "udp://:14540")
 
@@ -488,10 +589,12 @@ async def main():
     print("  3  -- Simulate battery drain")
     print("  4  -- Add barometer offset")
     print("  5  -- Add magnetometer offset")
-    print("  6  -- Restore all faults")
+    print("  6  -- Inject wind (8 m/s from north, moderate turbulence)")
+    print("  7  -- Restore all faults")
     print("  s1 -- Scenario: Progressive GPS degradation")
     print("  s2 -- Scenario: Altitude confusion")
     print("  s3 -- Scenario: Sensor cascade failure")
+    print("  s4 -- Scenario: Wind shear")
     print("  q  -- Quit")
     print("=" * 60)
 
@@ -512,6 +615,8 @@ async def main():
         elif cmd == "5":
             await injector.inject_mag_offset(0.3, 0.3, 0.1)
         elif cmd == "6":
+            await injector.inject_wind(speed_m_s=8.0, direction_deg=0.0, turbulence=3.0)
+        elif cmd == "7":
             await injector.restore_all()
         elif cmd == "s1":
             asyncio.create_task(scenarios.scenario_gps_degradation(delay_seconds=5))
@@ -519,11 +624,13 @@ async def main():
             asyncio.create_task(scenarios.scenario_altitude_confusion(delay_seconds=5))
         elif cmd == "s3":
             asyncio.create_task(scenarios.scenario_sensor_cascade(delay_seconds=5))
+        elif cmd == "s4":
+            asyncio.create_task(scenarios.scenario_wind_shear(delay_seconds=5))
         elif cmd == "q":
             await injector.restore_all()
             break
         else:
-            print("Unknown command. Try 1-6, s1-s3, or q.")
+            print("Unknown command. Try 1-7, s1-s4, or q.")
 
     logger.info("Fault injector stopped.")
 
