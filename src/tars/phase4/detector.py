@@ -5,11 +5,13 @@ Converts matched state sequences into bounded incidents.
 
 The detector:
 1. Evaluates all states against deterministic rules.
-2. Groups consecutive matches of the same incident type.
-3. Merges matches when the gap is below INCIDENT_MAX_GAP_MS.
-4. Enforces minimum persistence thresholds (INCIDENT_MIN_STATES).
-5. Produces stable incident IDs for deterministic repeated processing.
-6. Preserves peak severity, peak risk, phases, and deduplicated evidence.
+2. Runs statistical detection (battery drop rate, altitude oscillation,
+   sustained risk) and injects additional RuleMatches.
+3. Groups consecutive matches of the same incident type.
+4. Merges matches when the gap is below INCIDENT_MAX_GAP_MS.
+5. Enforces minimum persistence thresholds (INCIDENT_MIN_STATES).
+6. Produces stable incident IDs for deterministic repeated processing.
+7. Preserves peak severity, peak risk, phases, and deduplicated evidence.
 
 Immediate rules (sensor_health_failure, high_risk >= 0.8) bypass
 the minimum persistence threshold.
@@ -23,6 +25,11 @@ from collections import defaultdict
 from .config import settings
 from .models import Incident, IncidentType, RuleMatch, Severity
 from .rules import evaluate_state
+from .statistics import (
+    detect_altitude_oscillation,
+    detect_battery_drop_rate,
+    detect_sustained_risk,
+)
 
 
 # Incident types that trigger immediately (min_states = 1)
@@ -73,6 +80,88 @@ def _is_immediate(match: RuleMatch) -> bool:
     return False
 
 
+def _run_statistical_detection(
+    states: list[dict],
+    matches_by_type: dict[IncidentType, list[RuleMatch]],
+) -> None:
+    """
+    Run statistical detectors over the full state sequence and inject
+    additional RuleMatch entries into *matches_by_type* in-place.
+
+    Statistical detectors enrich the deterministic rule matches with
+    trend-based evidence (battery drain rate, altitude oscillation,
+    sustained risk).
+    """
+    if len(states) < 2:
+        return
+
+    # -- Battery drop rate ------------------------------------------------
+    battery_pcts = [
+        s.get("metrics", {}).get("battery_percent")
+        for s in states
+    ]
+    elapsed_vals = [s.get("elapsed_ms", 0) for s in states]
+
+    # Only run if we have numeric battery data
+    if all(v is not None for v in battery_pcts):
+        evidence = detect_battery_drop_rate(
+            battery_percents=battery_pcts,  # type: ignore[arg-type]
+            elapsed_ms_values=elapsed_vals,
+        )
+        if evidence:
+            # Attach evidence to the first state where a fast drop was seen
+            # by creating a synthetic RuleMatch
+            matches_by_type[IncidentType.BATTERY_DEGRADATION].append(
+                RuleMatch(
+                    incident_type=IncidentType.BATTERY_DEGRADATION,
+                    severity=Severity.HIGH,
+                    sequence=states[0].get("sequence", 0),
+                    elapsed_ms=states[0].get("elapsed_ms", 0),
+                    phase=states[0].get("phase", "unknown"),
+                    evidence=evidence,
+                    risk=states[0].get("risk", 0.0),
+                )
+            )
+
+    # -- Altitude oscillation ---------------------------------------------
+    altitudes = [
+        s.get("metrics", {}).get("relative_altitude_m")
+        for s in states
+    ]
+    if all(v is not None for v in altitudes):
+        evidence = detect_altitude_oscillation(
+            altitudes=altitudes,  # type: ignore[arg-type]
+        )
+        if evidence:
+            matches_by_type[IncidentType.ALTITUDE_INSTABILITY].append(
+                RuleMatch(
+                    incident_type=IncidentType.ALTITUDE_INSTABILITY,
+                    severity=Severity.MEDIUM,
+                    sequence=states[0].get("sequence", 0),
+                    elapsed_ms=states[0].get("elapsed_ms", 0),
+                    phase=states[0].get("phase", "unknown"),
+                    evidence=evidence,
+                    risk=states[0].get("risk", 0.0),
+                )
+            )
+
+    # -- Sustained risk ---------------------------------------------------
+    risk_vals = [s.get("risk", 0.0) for s in states]
+    evidence = detect_sustained_risk(risk_values=risk_vals)
+    if evidence:
+        matches_by_type[IncidentType.HIGH_RISK_STATE].append(
+            RuleMatch(
+                incident_type=IncidentType.HIGH_RISK_STATE,
+                severity=Severity.HIGH,
+                sequence=states[0].get("sequence", 0),
+                elapsed_ms=states[0].get("elapsed_ms", 0),
+                phase=states[0].get("phase", "unknown"),
+                evidence=evidence,
+                risk=max(risk_vals),
+            )
+        )
+
+
 def detect_incidents(
     states: list[dict],
     mission_id: str,
@@ -96,13 +185,16 @@ def detect_incidents(
     if min_states is None:
         min_states = settings.INCIDENT_MIN_STATES
 
-    # Step 1: Evaluate all states and group matches by incident type
+    # Step 1: Evaluate all states against deterministic rules
     matches_by_type: dict[IncidentType, list[RuleMatch]] = defaultdict(list)
 
     for state in states:
         state_matches = evaluate_state(state)
         for match in state_matches:
             matches_by_type[match.incident_type].append(match)
+
+    # Step 1b: Run statistical detectors and inject additional matches
+    _run_statistical_detection(states, matches_by_type)
 
     # Step 2: Collapse each type's matches into incidents
     incidents: list[Incident] = []

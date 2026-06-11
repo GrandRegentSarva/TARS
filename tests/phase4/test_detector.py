@@ -313,3 +313,79 @@ class TestMultipleIncidentTypes:
         incidents = detect_incidents(states, "test_mission", min_states=1)
         for i in range(1, len(incidents)):
             assert incidents[i].start_ms >= incidents[i - 1].start_ms
+
+
+class TestStatisticalDetection:
+    """Test that statistical detectors are integrated into detect_incidents."""
+
+    def test_battery_drop_rate_adds_evidence(self):
+        """Fast battery drain should produce battery_degradation evidence."""
+        states = []
+        for i in range(5):
+            states.append(make_state(
+                sequence=i + 1,
+                elapsed_ms=(i + 1) * 1000,
+                phase="cruise",
+                battery_level="weak",
+                battery_percent=90.0 - i * 10.0,  # 90, 80, 70, 60, 50
+            ))
+        incidents = detect_incidents(states, "test_mission", min_states=1)
+        battery_incidents = [
+            inc for inc in incidents
+            if inc.incident_type == IncidentType.BATTERY_DEGRADATION
+        ]
+        assert len(battery_incidents) >= 1
+        # Should have statistical evidence about drop rate
+        all_evidence = []
+        for inc in battery_incidents:
+            all_evidence.extend(inc.evidence)
+        assert any("dropping" in e.lower() or "%/s" in e for e in all_evidence)
+
+    def test_altitude_oscillation_adds_evidence(self):
+        """Altitude oscillation should enrich altitude_instability incidents."""
+        states = []
+        for i in range(12):
+            alt = 20.0 + (5.0 if i % 2 == 0 else -5.0)
+            states.append(make_state(
+                sequence=i + 1,
+                elapsed_ms=(i + 1) * 1000,
+                phase="cruise",
+                altitude_stability="unstable",
+                relative_altitude_m=alt,
+            ))
+        incidents = detect_incidents(states, "test_mission", min_states=1)
+        alt_incidents = [
+            inc for inc in incidents
+            if inc.incident_type == IncidentType.ALTITUDE_INSTABILITY
+        ]
+        assert len(alt_incidents) >= 1
+        all_evidence = []
+        for inc in alt_incidents:
+            all_evidence.extend(inc.evidence)
+        assert any("oscillat" in e.lower() for e in all_evidence)
+
+    def test_sustained_risk_adds_evidence(self):
+        """Sustained elevated risk should enrich high_risk_state incidents."""
+        states = make_states(
+            10,
+            phase="cruise",
+            health="degraded",
+            risk=0.75,
+            gps_quality="weak",
+        )
+        incidents = detect_incidents(states, "test_mission", min_states=1)
+        risk_incidents = [
+            inc for inc in incidents
+            if inc.incident_type == IncidentType.HIGH_RISK_STATE
+        ]
+        assert len(risk_incidents) >= 1
+        all_evidence = []
+        for inc in risk_incidents:
+            all_evidence.extend(inc.evidence)
+        assert any("rolling" in e.lower() or "sustained" in e.lower() or "mean" in e.lower() for e in all_evidence)
+
+    def test_nominal_states_no_statistical_incidents(self):
+        """Nominal states should not produce statistical incidents."""
+        states = make_nominal_states(count=20)
+        incidents = detect_incidents(states, "test_mission")
+        assert len(incidents) == 0
