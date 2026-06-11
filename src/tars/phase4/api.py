@@ -41,6 +41,7 @@ logger = logging.getLogger("phase4.api")
 # ---------------------------------------------------------------------------
 _store: Optional[IncidentStore] = None
 _service: Optional[IncidentService] = None
+_state_client: Optional[StateClient] = None
 
 
 def get_service() -> IncidentService:
@@ -56,13 +57,13 @@ def get_service() -> IncidentService:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage Redis connection lifecycle."""
-    global _store, _service
+    global _store, _service, _state_client
 
     _store = IncidentStore()
     await _store.connect()
 
-    state_client = StateClient()
-    _service = IncidentService(store=_store, state_client=state_client)
+    _state_client = StateClient()
+    _service = IncidentService(store=_store, state_client=_state_client)
 
     logger.info("Phase 4 Incident Engine started")
     logger.info("Redis: %s", settings.REDIS_URL)
@@ -91,14 +92,19 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Return API and Redis readiness."""
+    """Return API, Redis, and Phase 3 readiness."""
     redis_ok = False
     if _store is not None:
         redis_ok = await _store.ping()
 
+    phase3_ok = False
+    if _state_client is not None:
+        phase3_ok = await _state_client.health_check()
+
     return HealthResponse(
         status="ok",
         redis="ok" if redis_ok else "unavailable",
+        phase3="ok" if phase3_ok else "unavailable",
     )
 
 

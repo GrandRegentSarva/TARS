@@ -65,8 +65,10 @@ async def api_client(require_redis_for_api):
     import tars.phase4.api as api_module
     original_store = api_module._store
     original_service = api_module._service
+    original_state_client = api_module._state_client
     api_module._store = store
     api_module._service = service
+    api_module._state_client = mock_state_client
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -77,6 +79,7 @@ async def api_client(require_redis_for_api):
     await store.close()
     api_module._store = original_store
     api_module._service = original_service
+    api_module._state_client = original_state_client
 
 
 # =============================================================================
@@ -94,6 +97,8 @@ class TestHealthEndpoint:
         data = response.json()
         assert data["status"] == "ok"
         assert data["redis"] == "ok"
+        # Phase 3 is mocked to return True for health_check
+        assert data["phase3"] == "ok"
 
 
 # =============================================================================

@@ -101,6 +101,7 @@ class HealthResponse(BaseModel):
     """GET /health response."""
     status: str = "ok"
     redis: str = "ok"
+    phase3: str = "ok"
 
 
 class ProcessRequest(BaseModel):
