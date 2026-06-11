@@ -94,6 +94,40 @@ class IncidentStore:
             pipe.zadd(key, {incident.model_dump_json(): incident.start_ms})
         await pipe.execute()
 
+    async def merge_incidents(
+        self,
+        mission_id: str,
+        incidents: list[Incident],
+        from_ms: int = 0,
+        to_ms: int | None = None,
+    ) -> int:
+        """
+        Merge new incidents into the existing timeline for a time window.
+
+        Removes existing incidents whose start_ms falls within
+        [from_ms, to_ms] and inserts the new ones.  Incidents outside
+        the window are preserved.
+
+        Args:
+            mission_id: Mission identifier.
+            incidents: New incidents for the window.
+            from_ms: Window start (inclusive).
+            to_ms: Window end (inclusive). None = +inf.
+
+        Returns:
+            Number of incidents written.
+        """
+        key = self._key(mission_id, "timeline")
+        max_score = to_ms if to_ms is not None else "+inf"
+
+        pipe = self.redis.pipeline()
+        # Remove only the incidents in the target window
+        pipe.zremrangebyscore(key, min=from_ms, max=max_score)
+        for incident in incidents:
+            pipe.zadd(key, {incident.model_dump_json(): incident.start_ms})
+        await pipe.execute()
+        return len(incidents)
+
     async def get_incidents(
         self,
         mission_id: str,

@@ -108,19 +108,55 @@ class IncidentService:
                 incidents_detected, mission_id,
             )
 
+            # Determine if this is a partial window request
+            is_partial = from_ms > 0 or to_ms is not None
+
             # Write incidents to Redis
             if overwrite:
-                await self._store.replace_incidents(mission_id, incidents)
-            else:
-                # Only write if no existing incidents
-                existing = await self._store.get_incidents(mission_id)
-                if not existing:
-                    await self._store.replace_incidents(mission_id, incidents)
-                else:
-                    logger.info(
-                        "Skipping write: %d existing incidents for '%s'",
-                        len(existing), mission_id,
+                if is_partial:
+                    # Partial window: merge into existing timeline,
+                    # only replacing incidents within the requested window.
+                    await self._store.merge_incidents(
+                        mission_id, incidents,
+                        from_ms=from_ms, to_ms=to_ms,
                     )
+                else:
+                    # Full reprocess: replace everything
+                    await self._store.replace_incidents(mission_id, incidents)
+            else:
+                if is_partial:
+                    # Partial + no-overwrite: merge new incidents but
+                    # keep any existing incidents in the window too.
+                    # We add only incidents whose IDs don't already exist.
+                    existing = await self._store.get_incidents(
+                        mission_id, from_ms, to_ms,
+                    )
+                    existing_ids = {i.incident_id for i in existing}
+                    new_incidents = [
+                        i for i in incidents
+                        if i.incident_id not in existing_ids
+                    ]
+                    if new_incidents:
+                        for inc in new_incidents:
+                            key = self._store._key(mission_id, "timeline")
+                            await self._store.redis.zadd(
+                                key,
+                                {inc.model_dump_json(): inc.start_ms},
+                            )
+                    incidents_detected = len(new_incidents)
+                else:
+                    # Full + no-overwrite: only write if no existing incidents
+                    existing = await self._store.get_incidents(mission_id)
+                    if not existing:
+                        await self._store.replace_incidents(
+                            mission_id, incidents,
+                        )
+                    else:
+                        incidents_detected = 0
+                        logger.info(
+                            "Skipping write: %d existing incidents for '%s'",
+                            len(existing), mission_id,
+                        )
 
             # Set status to complete
             completed_at = datetime.now(timezone.utc).isoformat()
