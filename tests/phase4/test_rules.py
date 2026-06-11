@@ -226,7 +226,7 @@ class TestSensorHealthFailure:
         matches = check_sensor_health_failure(state)
         assert len(matches) == 0
 
-    def test_critical_health(self):
+    def test_critical_health_with_sensor_reason(self):
         state = make_state(
             health="critical",
             reasons=["Global position not ok", "GPS signal missing"],
@@ -242,7 +242,42 @@ class TestSensorHealthFailure:
             reasons=["Magnetometer calibration failed"],
         )
         matches = check_sensor_health_failure(state)
+        assert len(matches) == 1
         assert any("failed" in e.lower() for e in matches[0].evidence)
+
+    def test_no_match_battery_only_critical(self):
+        """Battery-only critical state must NOT produce sensor_health_failure."""
+        state = make_state(
+            health="critical",
+            reasons=["Battery level critical"],
+            battery_level="unstable",
+            battery_percent=8.0,
+        )
+        matches = check_sensor_health_failure(state)
+        assert len(matches) == 0
+
+    def test_no_match_critical_no_reasons(self):
+        """Critical health with no reasons should not produce sensor incident."""
+        state = make_state(health="critical", reasons=[])
+        matches = check_sensor_health_failure(state)
+        assert len(matches) == 0
+
+    def test_match_accelerometer_failure(self):
+        state = make_state(
+            health="critical",
+            reasons=["Accelerometer sensor failed"],
+        )
+        matches = check_sensor_health_failure(state)
+        assert len(matches) == 1
+
+    def test_match_gps_position_keyword(self):
+        """Reason mentioning 'position' should match even without 'fail'."""
+        state = make_state(
+            health="critical",
+            reasons=["Global position not ok"],
+        )
+        matches = check_sensor_health_failure(state)
+        assert len(matches) == 1
 
 
 # =============================================================================
@@ -337,14 +372,30 @@ class TestEvaluateState:
             gps_quality="missing",
             battery_level="unstable",
             battery_percent=10.0,
+            reasons=["Global position not ok", "GPS signal missing"],
         )
         matches = evaluate_state(state)
         types = {m.incident_type for m in matches}
-        # Should match navigation, battery, sensor health, high risk, telemetry
+        # Should match navigation, battery, sensor health, high risk
         assert IncidentType.NAVIGATION_INSTABILITY in types
         assert IncidentType.BATTERY_DEGRADATION in types
         assert IncidentType.SENSOR_HEALTH_FAILURE in types
         assert IncidentType.HIGH_RISK_STATE in types
+
+    def test_critical_battery_no_sensor_incident(self):
+        """Critical health from battery alone must not produce sensor incident."""
+        state = make_state(
+            phase="cruise",
+            health="critical",
+            risk=0.85,
+            battery_level="unstable",
+            battery_percent=8.0,
+            reasons=["Battery level critical"],
+        )
+        matches = evaluate_state(state)
+        types = {m.incident_type for m in matches}
+        assert IncidentType.BATTERY_DEGRADATION in types
+        assert IncidentType.SENSOR_HEALTH_FAILURE not in types
 
     def test_sequence_and_elapsed_preserved(self):
         state = make_state(

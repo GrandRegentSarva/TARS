@@ -223,28 +223,49 @@ def check_sensor_health_failure(state: dict) -> list[RuleMatch]:
 
     Triggers immediately when:
     - Phase 3 health is critical
-    - Evidence contains failed sensor or position health check
+    - At least one reason indicates a sensor or position failure
+
+    Does NOT trigger for battery-only critical states -- those are
+    handled by check_battery_degradation().
     """
     matches: list[RuleMatch] = []
     health = state.get("health", "unknown")
 
     if health == "critical":
-        evidence = ["Health status critical"]
         reasons = state.get("reasons", [])
+
+        # Keywords that indicate sensor / position failures
+        _SENSOR_KEYWORDS = (
+            "position", "gps", "magnetometer", "accelerometer",
+            "gyrometer", "gyroscope", "barometer", "imu", "sensor",
+            "calibration",
+        )
+        _FAILURE_KEYWORDS = ("fail", "not ok", "missing", "error", "lost")
+
+        sensor_evidence: list[str] = []
         for reason in reasons:
             r_lower = reason.lower()
-            if "fail" in r_lower or "not ok" in r_lower or "missing" in r_lower:
-                evidence.append(reason)
+            has_sensor = any(kw in r_lower for kw in _SENSOR_KEYWORDS)
+            has_failure = any(kw in r_lower for kw in _FAILURE_KEYWORDS)
+            if has_sensor and has_failure:
+                sensor_evidence.append(reason)
+            elif has_sensor:
+                # Sensor mentioned without explicit failure keyword --
+                # still counts (e.g. "Global position not ok")
+                sensor_evidence.append(reason)
 
-        matches.append(RuleMatch(
-            incident_type=IncidentType.SENSOR_HEALTH_FAILURE,
-            severity=Severity.CRITICAL,
-            sequence=state.get("sequence", 0),
-            elapsed_ms=state.get("elapsed_ms", 0),
-            phase=state.get("phase", "unknown"),
-            evidence=evidence,
-            risk=state.get("risk", 0.0),
-        ))
+        # Only emit if at least one reason is sensor/position related
+        if sensor_evidence:
+            evidence = ["Health status critical"] + sensor_evidence
+            matches.append(RuleMatch(
+                incident_type=IncidentType.SENSOR_HEALTH_FAILURE,
+                severity=Severity.CRITICAL,
+                sequence=state.get("sequence", 0),
+                elapsed_ms=state.get("elapsed_ms", 0),
+                phase=state.get("phase", "unknown"),
+                evidence=evidence,
+                risk=state.get("risk", 0.0),
+            ))
 
     return matches
 
