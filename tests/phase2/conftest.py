@@ -5,13 +5,14 @@ Shared fixtures for Phase 2 tests.
 
 Uses a SEPARATE test database (tars_test) to avoid destroying production data.
 Tests create and drop tables per session to ensure isolation.
-Skips gracefully if PostgreSQL is not reachable.
+Skips the entire test suite fast if PostgreSQL is not reachable.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import socket
 import tempfile
 from datetime import datetime, timezone, timedelta
 
@@ -37,11 +38,48 @@ TEST_DATABASE_URL = os.getenv(
 
 
 # ---------------------------------------------------------------------------
+# Fast synchronous connectivity check at import time.
+# If PostgreSQL is unreachable, skip ALL tests in this package immediately
+# instead of waiting 3s × 32 tests.
+# ---------------------------------------------------------------------------
+def _pg_is_reachable(host: str = "localhost", port: int = 5432, timeout: float = 2.0) -> bool:
+    """Synchronous TCP check -- no asyncpg, no driver, just a socket probe."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, ConnectionRefusedError, TimeoutError):
+        return False
+
+
+# Parse host/port from TEST_DATABASE_URL for the socket check
+_pg_host = "localhost"
+_pg_port = 5432
+try:
+    _at_part = TEST_DATABASE_URL.split("@")[1]  # tars:tars@localhost:5432/tars_test
+    _host_port = _at_part.split("/")[0]          # localhost:5432
+    if ":" in _host_port:
+        _pg_host, _pg_port_str = _host_port.rsplit(":", 1)
+        _pg_port = int(_pg_port_str)
+    else:
+        _pg_host = _host_port
+except (IndexError, ValueError):
+    pass
+
+_PG_AVAILABLE = _pg_is_reachable(_pg_host, _pg_port)
+
+
+@pytest.fixture(autouse=True)
+def _require_postgres():
+    """Skip every test in the phase2 package if PostgreSQL is not reachable."""
+    if not _PG_AVAILABLE:
+        pytest.skip(f"PostgreSQL not reachable at {_pg_host}:{_pg_port}")
+
+
+# ---------------------------------------------------------------------------
 # Ensure the test database exists (create it if needed)
 # ---------------------------------------------------------------------------
 async def _ensure_test_db_exists():
     """Create the tars_test database if it doesn't exist."""
-    # Connect to the default 'tars' database to create tars_test
     admin_url = TEST_DATABASE_URL.rsplit("/", 1)[0] + "/tars"
     engine = create_async_engine(
         admin_url,
@@ -55,22 +93,6 @@ async def _ensure_test_db_exists():
             )
             if result.scalar() is None:
                 await conn.execute(text("CREATE DATABASE tars_test"))
-    finally:
-        await engine.dispose()
-
-
-async def _check_postgres_reachable() -> bool:
-    """Check if PostgreSQL is reachable with a short timeout."""
-    engine = create_async_engine(
-        TEST_DATABASE_URL,
-        connect_args={"timeout": 3},
-    )
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        return True
-    except Exception:
-        return False
     finally:
         await engine.dispose()
 
@@ -179,20 +201,11 @@ async def db_engine():
     Create a test database engine and tables.
 
     Uses tars_test database (separate from production tars).
-    Skips all tests if PostgreSQL is not reachable.
+    The pytestmark above already skips if PostgreSQL is unreachable,
+    so this fixture only runs when connectivity is confirmed.
     """
-    # Check connectivity first with a short timeout
-    reachable = await _check_postgres_reachable()
-    if not reachable:
-        # Try to create the test database (it may not exist yet)
-        try:
-            await _ensure_test_db_exists()
-            reachable = await _check_postgres_reachable()
-        except Exception:
-            pass
-
-    if not reachable:
-        pytest.skip("PostgreSQL is not reachable at localhost:5432")
+    # Ensure tars_test database exists
+    await _ensure_test_db_exists()
 
     engine = create_async_engine(
         TEST_DATABASE_URL,
