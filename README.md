@@ -14,9 +14,9 @@ Built with: PX4, Gazebo, MAVSDK, Python (future: Gemini, Phoenix, Neo4j)
 
 ---
 
-## Current Status: Phase 4 -- Incident Engine
+## Current Status: Phase 5 -- Gemini Reasoning Layer
 
-Phase 4 collapses noisy operational state from Phase 3 into a small number of meaningful, bounded incidents. Detection is fully deterministic: rules, thresholds, and simple statistical analysis only -- no AI.
+Phase 5 analyzes bounded Phase 4 incidents using Google Gemini (via Google ADK) to produce structured, advisory root-cause assessments and recommendations. Phase 5 is an analysis layer only -- it never issues flight commands, modifies mission state, or participates in the flight-critical control path.
 
 ### What's Working
 
@@ -63,6 +63,20 @@ Phase 4 collapses noisy operational state from Phase 3 into a small number of me
 - [x] FastAPI REST API on port 8003 (process, list, get, status)
 - [x] Async HTTP client for Phase 3 state timelines
 - [x] 118 tests (rules, statistics, detector, store, API)
+
+**Phase 5 -- Gemini Reasoning Layer:**
+- [x] Advisory root-cause analysis of Phase 4 incidents via Google Gemini (ADK)
+- [x] Structured reasoning output (root cause, confidence, recommendation, rationale, factors, uncertainties)
+- [x] Provider-neutral interface (injectable; tests use deterministic fake provider)
+- [x] Versioned system instruction and incident-only prompts
+- [x] Bounded incident contract (no raw telemetry sent to Gemini)
+- [x] Advisory-only validation (control commands rejected at model boundary)
+- [x] Redis reasoning store (hash per mission, one analysis per incident)
+- [x] Overwrite control (reuse existing analysis or reinvoke Gemini)
+- [x] FastAPI REST API on port 8004 (analyze, get, list, health)
+- [x] Async HTTP client for Phase 4 incidents
+- [x] Graceful startup without Gemini credentials (unconfigured status)
+- [x] Phase 5 tests (models, prompts, client, provider, store, service, API)
 
 ---
 
@@ -181,16 +195,26 @@ TARS/
 |       |   |-- store.py               # Async Redis state store
 |       |   |-- replay_client.py       # HTTP client for Phase 2 API
 |       |   +-- service.py             # Processing orchestration
-|       +-- phase4/                     # Phase 4 -- Incident Engine
-|           |-- api.py                  # FastAPI app (port 8003)
+|       |-- phase4/                     # Phase 4 -- Incident Engine
+|       |   |-- api.py                  # FastAPI app (port 8003)
+|       |   |-- config.py              # Environment settings
+|       |   |-- models.py              # Incident enums and schemas
+|       |   |-- rules.py               # Deterministic state rules
+|       |   |-- statistics.py          # Rolling windows and trend detection
+|       |   |-- detector.py            # Incident collapser
+|       |   |-- store.py               # Async Redis incident store
+|       |   |-- state_client.py        # HTTP client for Phase 3 API
+|       |   +-- service.py             # Detection orchestration
+|       +-- phase5/                     # Phase 5 -- Gemini Reasoning Layer
+|           |-- api.py                  # FastAPI app (port 8004)
 |           |-- config.py              # Environment settings
-|           |-- models.py              # Incident enums and schemas
-|           |-- rules.py               # Deterministic state rules
-|           |-- statistics.py          # Rolling windows and trend detection
-|           |-- detector.py            # Incident collapser
-|           |-- store.py               # Async Redis incident store
-|           |-- state_client.py        # HTTP client for Phase 3 API
-|           +-- service.py             # Detection orchestration
+|           |-- models.py              # Reasoning schemas and provider protocol
+|           |-- prompts.py             # Versioned system instruction and prompt
+|           |-- agent.py               # Google ADK Gemini agent configuration
+|           |-- provider.py            # Gemini + fake reasoning providers
+|           |-- incident_client.py     # HTTP client for Phase 4 API
+|           |-- store.py               # Async Redis reasoning store
+|           +-- service.py             # Reasoning orchestration
 |-- migrations/                         # Alembic database migrations
 |   |-- env.py
 |   +-- versions/
@@ -202,7 +226,9 @@ TARS/
 |   |-- start_state_api.sh              # Start Phase 3 State API server
 |   |-- process_mission_state.sh        # Process a mission through Phase 3
 |   |-- start_incident_api.sh           # Start Phase 4 Incident API server
-|   +-- process_mission_incidents.sh    # Detect incidents for a mission
+|   |-- process_mission_incidents.sh    # Detect incidents for a mission
+|   |-- start_reasoning_api.sh          # Start Phase 5 Reasoning API server
+|   +-- analyze_incident.sh            # Analyze an incident through Phase 5
 |-- tests/
 |   |-- phase2/                         # Phase 2 tests
 |   |   |-- test_importer.py
@@ -214,11 +240,19 @@ TARS/
 |   |   |-- test_state_processor.py
 |   |   |-- test_store.py
 |   |   +-- test_api.py
-|   +-- phase4/                         # Phase 4 tests
-|       |-- test_rules.py
-|       |-- test_statistics.py
-|       |-- test_detector.py
+|   |-- phase4/                         # Phase 4 tests
+|   |   |-- test_rules.py
+|   |   |-- test_statistics.py
+|   |   |-- test_detector.py
+|   |   |-- test_store.py
+|   |   +-- test_api.py
+|   +-- phase5/                         # Phase 5 tests
+|       |-- test_models.py
+|       |-- test_prompts.py
+|       |-- test_client.py
+|       |-- test_provider.py
 |       |-- test_store.py
+|       |-- test_service.py
 |       +-- test_api.py
 |-- output/                             # Telemetry JSON files
 |-- alembic.ini                         # Alembic configuration
@@ -437,6 +471,82 @@ PYTHONPATH=src .venv/bin/pytest tests/phase4/ -v
 
 ---
 
+## Phase 5 -- Gemini Reasoning Layer
+
+Phase 5 runs independently of PX4/Gazebo. You need Redis, the Phase 4 Incident API (for incident data), and the Phase 5 Reasoning API.
+
+### 1. Start Redis and Phase 4
+
+```bash
+# Start Redis
+docker compose -f docker/docker-compose.yml up redis -d
+
+# Start Phase 2 + Phase 3 + Phase 4 APIs
+./scripts/start_replay_api.sh &
+./scripts/start_state_api.sh &
+./scripts/start_incident_api.sh &
+```
+
+### 2. Configure Gemini (Optional for Startup)
+
+```bash
+# Set your Gemini API key in .env
+echo "GEMINI_API_KEY=your-key-here" >> .env
+
+# Or export directly
+export GEMINI_API_KEY=your-key-here
+```
+
+> **Note:** The API starts without a Gemini key but analysis endpoints will return configuration errors. Health endpoint reports `gemini: unconfigured`.
+
+### 3. Start the Reasoning API
+
+```bash
+./scripts/start_reasoning_api.sh
+
+# API docs available at http://localhost:8004/docs
+# Health check at http://localhost:8004/health
+```
+
+### 4. Analyze an Incident
+
+```bash
+# Via the script (requires Phase 4 + Phase 5 APIs running)
+./scripts/analyze_incident.sh mission_20260608_120000 inc_abc123
+
+# Or via curl
+curl -X POST http://localhost:8004/api/v1/reasoning/analyze/mission_20260608_120000/inc_abc123 \
+  -H "Content-Type: application/json" \
+  -d '{"overwrite": true}'
+```
+
+### 5. Query Analyses
+
+```bash
+# Get analysis for a specific incident
+curl http://localhost:8004/api/v1/reasoning/mission_20260608_120000/inc_abc123
+
+# List all analyses for a mission
+curl http://localhost:8004/api/v1/reasoning/mission_20260608_120000
+
+# Reuse existing analysis (no Gemini call)
+curl -X POST http://localhost:8004/api/v1/reasoning/analyze/mission_20260608_120000/inc_abc123 \
+  -H "Content-Type: application/json" \
+  -d '{"overwrite": false}'
+```
+
+### 6. Run Tests
+
+```bash
+# Pure logic tests (no Redis or Gemini required)
+PYTHONPATH=src .venv/bin/pytest tests/phase5/test_models.py tests/phase5/test_prompts.py tests/phase5/test_provider.py tests/phase5/test_client.py -v
+
+# All tests including Redis integration (requires Redis running)
+PYTHONPATH=src .venv/bin/pytest tests/phase5/ -v
+```
+
+---
+
 ## Telemetry Output Format
 
 Each mission produces a JSON file in `output/`:
@@ -569,6 +679,18 @@ Edit `.env` or set environment variables:
 | `INCIDENT_HIGH_RISK` | `0.8` | Risk threshold for immediate incident |
 | `INCIDENT_ELEVATED_RISK` | `0.6` | Risk threshold for elevated detection |
 
+### Phase 5
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PHASE4_API_URL` | `http://localhost:8003` | Phase 4 Incident API base URL |
+| `REASONING_API_HOST` | `0.0.0.0` | Reasoning API server host |
+| `REASONING_API_PORT` | `8004` | Reasoning API server port |
+| `INCIDENT_CLIENT_TIMEOUT` | `30.0` | HTTP client timeout for Phase 4 calls |
+| `GEMINI_API_KEY` | *(empty)* | Gemini API key (required for live reasoning) |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model identifier |
+| `GEMINI_TEMPERATURE` | `0.1` | Gemini temperature (low for stable reasoning) |
+
 ---
 
 ## Hardware Notes
@@ -590,9 +712,9 @@ Gazebo runs in **headless mode** (no 3D rendering) to fit within RAM constraints
 | 1 | Mission Foundation (PX4 + Gazebo + MAVSDK) | ✅ Done |
 | 2 | Mission Replay System (FastAPI + PostgreSQL) | ✅ Done |
 | 3 | State Engine (Python + Redis) | ✅ Done |
-| 4 | Incident Engine (Rules + Statistical Detection) | ✅ Current |
-| 5 | Gemini Reasoning Layer (Google ADK) | Next |
-| 6 | Phoenix Integration (OpenInference Tracing) | Planned |
+| 4 | Incident Engine (Rules + Statistical Detection) | ✅ Done |
+| 5 | Gemini Reasoning Layer (Google ADK) | ✅ Current |
+| 6 | Phoenix Integration (OpenInference Tracing) | Next |
 | 7 | Neo4j Operational Memory | Planned |
 | 8 | Phoenix MCP (Self-Introspection) | Planned |
 | 9 | Evaluation Layer | Planned |

@@ -57,3 +57,13 @@ pytest-asyncio>=0.23.0
 
 # Redis -- Async client for operational state store
 redis>=5.0.0
+
+# ---------------------------------------------------------------------------
+# Phase 5 -- Gemini Reasoning Layer
+# ---------------------------------------------------------------------------
+
+# Google ADK -- Agent Development Kit for Gemini integration
+google-adk>=1.0.0
+
+# Google GenAI -- Gemini SDK types and client
+google-genai>=1.0.0
