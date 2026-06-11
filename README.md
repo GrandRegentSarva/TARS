@@ -14,9 +14,9 @@ Built with: PX4, Gazebo, MAVSDK, Python (future: Gemini, Phoenix, Neo4j)
 
 ---
 
-## Current Status: Phase 3 -- State Engine
+## Current Status: Phase 4 -- Incident Engine
 
-Phase 3 transforms raw replay frames from Phase 2 into operational state snapshots. Each frame is classified into a mission phase, assessed for health, and scored for risk -- all stored in Redis for real-time querying.
+Phase 4 collapses noisy operational state from Phase 3 into a small number of meaningful, bounded incidents. Detection is fully deterministic: rules, thresholds, and simple statistical analysis only -- no AI.
 
 ### What's Working
 
@@ -49,6 +49,20 @@ Phase 3 transforms raw replay frames from Phase 2 into operational state snapsho
 - [x] FastAPI REST API on port 8002 (process, current state, timeline, state-at-time, status)
 - [x] Async HTTP client for Phase 2 replay data
 - [x] 83 tests (pure logic + Redis integration)
+
+**Phase 4 -- Incident Engine:**
+- [x] 7 deterministic incident types (navigation, battery, attitude, altitude, sensor, telemetry, high-risk)
+- [x] 4 severity levels (low, medium, high, critical)
+- [x] Single-state rule evaluation with configurable thresholds
+- [x] Incident collapsing (consecutive matches merged into bounded incidents)
+- [x] Gap-based merging (configurable INCIDENT_MAX_GAP_MS)
+- [x] Persistence thresholds (min_states) with immediate rules for critical events
+- [x] Stable deterministic incident IDs for repeated processing
+- [x] Statistical helpers (rolling mean/stddev, rate of change, oscillation detection)
+- [x] Redis incident store (timeline sorted set, processing metadata)
+- [x] FastAPI REST API on port 8003 (process, list, get, status)
+- [x] Async HTTP client for Phase 3 state timelines
+- [x] 118 tests (rules, statistics, detector, store, API)
 
 ---
 
@@ -134,7 +148,8 @@ TARS/
 |-- plans/                              # Architecture and planning docs
 |   |-- phase-1-mission-foundation.md
 |   |-- phase-2-mission-replay-system.md
-|   +-- phase-3-state-engine.md
+|   |-- phase-3-state-engine.md
+|   +-- phase-4-incident-engine.md
 |-- docker/                             # Docker setup
 |   |-- Dockerfile.px4-sitl             # PX4 SITL + Gazebo headless
 |   +-- docker-compose.yml              # PX4 SITL + PostgreSQL + Redis
@@ -156,16 +171,26 @@ TARS/
 |       |   +-- models/
 |       |       |-- db.py              # SQLAlchemy ORM tables
 |       |       +-- schemas.py         # API request/response schemas
-|       +-- phase3/                     # Phase 3 -- State Engine
-|           |-- api.py                  # FastAPI app (port 8002)
+|       |-- phase3/                     # Phase 3 -- State Engine
+|       |   |-- api.py                  # FastAPI app (port 8002)
+|       |   |-- config.py              # Environment settings
+|       |   |-- models.py              # Pydantic models and enums
+|       |   |-- phase_classifier.py    # Deterministic phase rules
+|       |   |-- risk.py                # Risk scoring and health assessment
+|       |   |-- state_processor.py     # Frame-to-state transformation
+|       |   |-- store.py               # Async Redis state store
+|       |   |-- replay_client.py       # HTTP client for Phase 2 API
+|       |   +-- service.py             # Processing orchestration
+|       +-- phase4/                     # Phase 4 -- Incident Engine
+|           |-- api.py                  # FastAPI app (port 8003)
 |           |-- config.py              # Environment settings
-|           |-- models.py              # Pydantic models and enums
-|           |-- phase_classifier.py    # Deterministic phase rules
-|           |-- risk.py                # Risk scoring and health assessment
-|           |-- state_processor.py     # Frame-to-state transformation
-|           |-- store.py               # Async Redis state store
-|           |-- replay_client.py       # HTTP client for Phase 2 API
-|           +-- service.py             # Processing orchestration
+|           |-- models.py              # Incident enums and schemas
+|           |-- rules.py               # Deterministic state rules
+|           |-- statistics.py          # Rolling windows and trend detection
+|           |-- detector.py            # Incident collapser
+|           |-- store.py               # Async Redis incident store
+|           |-- state_client.py        # HTTP client for Phase 3 API
+|           +-- service.py             # Detection orchestration
 |-- migrations/                         # Alembic database migrations
 |   |-- env.py
 |   +-- versions/
@@ -175,16 +200,24 @@ TARS/
 |   |-- start_replay_api.sh             # Start Phase 2 API server
 |   |-- import_mission.sh               # Import mission JSON via API
 |   |-- start_state_api.sh              # Start Phase 3 State API server
-|   +-- process_mission_state.sh        # Process a mission through Phase 3
+|   |-- process_mission_state.sh        # Process a mission through Phase 3
+|   |-- start_incident_api.sh           # Start Phase 4 Incident API server
+|   +-- process_mission_incidents.sh    # Detect incidents for a mission
 |-- tests/
 |   |-- phase2/                         # Phase 2 tests
 |   |   |-- test_importer.py
 |   |   |-- test_replay.py
 |   |   +-- test_api.py
-|   +-- phase3/                         # Phase 3 tests
-|       |-- test_phase_classifier.py
-|       |-- test_risk.py
-|       |-- test_state_processor.py
+|   |-- phase3/                         # Phase 3 tests
+|   |   |-- test_phase_classifier.py
+|   |   |-- test_risk.py
+|   |   |-- test_state_processor.py
+|   |   |-- test_store.py
+|   |   +-- test_api.py
+|   +-- phase4/                         # Phase 4 tests
+|       |-- test_rules.py
+|       |-- test_statistics.py
+|       |-- test_detector.py
 |       |-- test_store.py
 |       +-- test_api.py
 |-- output/                             # Telemetry JSON files
@@ -340,6 +373,70 @@ PYTHONPATH=src .venv/bin/pytest tests/phase3/ -v
 
 ---
 
+## Phase 4 -- Incident Engine
+
+Phase 4 runs independently of PX4/Gazebo. You need Redis, the Phase 3 State API (for state timelines), and the Phase 4 Incident API.
+
+### 1. Start Redis and Phase 3
+
+```bash
+# Start Redis
+docker compose -f docker/docker-compose.yml up redis -d
+
+# Start Phase 2 + Phase 3 APIs (Phase 4 depends on Phase 3 timelines)
+./scripts/start_replay_api.sh &
+./scripts/start_state_api.sh &
+```
+
+### 2. Start the Incident API
+
+```bash
+./scripts/start_incident_api.sh
+
+# API docs available at http://localhost:8003/docs
+# Health check at http://localhost:8003/health
+```
+
+### 3. Process Mission Incidents
+
+```bash
+# Via the script (requires Phase 3 + Phase 4 APIs running)
+./scripts/process_mission_incidents.sh mission_20260608_120000
+
+# Or via curl
+curl -X POST http://localhost:8003/api/v1/incidents/process/mission_20260608_120000 \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+### 4. Query Incidents
+
+```bash
+# List all incidents for a mission
+curl http://localhost:8003/api/v1/incidents/mission_20260608_120000
+
+# List incidents within a time range
+curl "http://localhost:8003/api/v1/incidents/mission_20260608_120000?from_ms=5000&to_ms=30000"
+
+# Get a specific incident by ID
+curl http://localhost:8003/api/v1/incidents/mission_20260608_120000/inc_abc123
+
+# Get processing status
+curl http://localhost:8003/api/v1/incidents/mission_20260608_120000/status
+```
+
+### 5. Run Tests
+
+```bash
+# Pure logic tests (no Redis required)
+PYTHONPATH=src .venv/bin/pytest tests/phase4/test_rules.py tests/phase4/test_statistics.py tests/phase4/test_detector.py -v
+
+# All tests including Redis integration (requires Redis running)
+PYTHONPATH=src .venv/bin/pytest tests/phase4/ -v
+```
+
+---
+
 ## Telemetry Output Format
 
 Each mission produces a JSON file in `output/`:
@@ -460,6 +557,18 @@ Edit `.env` or set environment variables:
 | `STATE_API_HOST` | `0.0.0.0` | State API server host |
 | `STATE_API_PORT` | `8002` | State API server port |
 
+### Phase 4
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PHASE3_API_URL` | `http://localhost:8002` | Phase 3 State API base URL |
+| `INCIDENT_API_HOST` | `0.0.0.0` | Incident API server host |
+| `INCIDENT_API_PORT` | `8003` | Incident API server port |
+| `INCIDENT_MAX_GAP_MS` | `5000` | Max gap between matches to merge |
+| `INCIDENT_MIN_STATES` | `3` | Min states for persistence threshold |
+| `INCIDENT_HIGH_RISK` | `0.8` | Risk threshold for immediate incident |
+| `INCIDENT_ELEVATED_RISK` | `0.6` | Risk threshold for elevated detection |
+
 ---
 
 ## Hardware Notes
@@ -480,9 +589,9 @@ Gazebo runs in **headless mode** (no 3D rendering) to fit within RAM constraints
 |-------|------|--------|
 | 1 | Mission Foundation (PX4 + Gazebo + MAVSDK) | ✅ Done |
 | 2 | Mission Replay System (FastAPI + PostgreSQL) | ✅ Done |
-| 3 | State Engine (Python + Redis) | ✅ Current |
-| 4 | Incident Engine (Rules + Statistical Detection) | Next |
-| 5 | Gemini Reasoning Layer (Google ADK) | Planned |
+| 3 | State Engine (Python + Redis) | ✅ Done |
+| 4 | Incident Engine (Rules + Statistical Detection) | ✅ Current |
+| 5 | Gemini Reasoning Layer (Google ADK) | Next |
 | 6 | Phoenix Integration (OpenInference Tracing) | Planned |
 | 7 | Neo4j Operational Memory | Planned |
 | 8 | Phoenix MCP (Self-Introspection) | Planned |
