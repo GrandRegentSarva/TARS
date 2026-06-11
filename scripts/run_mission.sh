@@ -55,6 +55,8 @@ export TELEMETRY_RATE_HZ="${TELEMETRY_RATE_HZ:-1}"
 export DRONE_ID="${DRONE_ID:-tars-sim-01}"
 export OUTPUT_DIR="${OUTPUT_DIR:-output}"
 export MISSION_ID="${MISSION_ID:-mission_$(date +%Y%m%d_%H%M%S)}"
+# FAULT_SCENARIO is optional -- pass through if set (s1, s2, s3, s4)
+export FAULT_SCENARIO="${FAULT_SCENARIO:-}"
 
 echo -e "${YELLOW}Configuration:${NC}"
 echo "  Mission ID:  $MISSION_ID"
@@ -62,6 +64,9 @@ echo "  Connection:  $PX4_CONNECTION"
 echo "  Rate:        ${TELEMETRY_RATE_HZ} Hz"
 echo "  Drone ID:    $DRONE_ID"
 echo "  Output:      $OUTPUT_DIR/"
+if [ -n "$FAULT_SCENARIO" ]; then
+    echo "  Fault:       scenario $FAULT_SCENARIO"
+fi
 echo ""
 
 # Create output directory
@@ -69,4 +74,4 @@ mkdir -p "$PROJECT_DIR/$OUTPUT_DIR"
 
 # Run the mission using the venv Python
 echo -e "${GREEN}Starting mission...${NC}"
-cd "$PROJECT_DIR" && .venv/bin/python3 -m src.phase1.mission_runner
+cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR/src" .venv/bin/python3 -m tars.phase1.mission_runner

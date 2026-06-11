@@ -63,14 +63,15 @@ TARS/
 |   |---- Dockerfile.px4-sitl         # PX4 SITL + Gazebo headless container
 |   +---- docker-compose.yml          # Orchestration
 |---- src/
-|   +---- phase1/
-|       |---- __init__.py
-|       |---- telemetry_collector.py  # Connects to PX4, streams telemetry
-|       |---- mission_runner.py       # Autonomous mission: takeoff -> waypoints -> land
-|       |---- fault_injector.py       # Injects GPS drift, wind, battery drain
-|       +---- models/
+|   +---- tars/
+|       +---- phase1/
 |           |---- __init__.py
-|           +---- telemetry.py        # Pydantic models for telemetry data
+|           |---- telemetry_collector.py  # Connects to PX4, streams telemetry
+|           |---- mission_runner.py       # Autonomous mission: takeoff -> waypoints -> land
+|           |---- fault_injector.py       # Injects GPS drift, wind, battery drain
+|           +---- models/
+|               |---- __init__.py
+|               +---- telemetry.py        # Pydantic models for telemetry data
 |---- scripts/
 |   |---- start_simulation.sh         # Launch PX4 + Gazebo via Docker
 |   +---- run_mission.sh              # Run a complete mission with telemetry

@@ -16,10 +16,10 @@ Key concepts:
 
 Usage:
     # Standalone -- just collect telemetry and print to console
-    python -m src.phase1.telemetry_collector
+    python -m tars.phase1.telemetry_collector
 
     # As a module -- import and use in mission_runner.py
-    from src.phase1.telemetry_collector import TelemetryCollector
+    from tars.phase1.telemetry_collector import TelemetryCollector
     collector = TelemetryCollector(drone)
     await collector.start()
 """
@@ -445,7 +445,7 @@ async def main():
     This connects to PX4 SITL and streams telemetry to the console.
     Useful for testing that the connection works before running missions.
 
-    Usage: python -m src.phase1.telemetry_collector
+    Usage: python -m tars.phase1.telemetry_collector
     """
     # Load configuration from environment
     connection_str = os.getenv("PX4_CONNECTION", "udp://:14540")

@@ -11,15 +11,16 @@ How it works:
 4. Starts the mission -- PX4 autopilot handles the actual flying
 5. Monitors mission progress until completion
 6. Telemetry collection runs concurrently the entire time
+7. Fault events from the injector are saved into the mission JSON
 
 The mission and telemetry collection run as parallel async tasks.
 When the mission finishes, telemetry is saved to a JSON file.
 
 Usage:
-    python -m src.phase1.mission_runner
+    python -m tars.phase1.mission_runner
 
     # With custom mission ID
-    MISSION_ID=mission_003 python -m src.phase1.mission_runner
+    MISSION_ID=mission_003 python -m tars.phase1.mission_runner
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from mavsdk.mission import MissionItem, MissionPlan
 
 from .models.telemetry import MissionResult
 from .telemetry_collector import TelemetryCollector
+from .fault_injector import FaultInjector, FaultScenarios
 
 logging.basicConfig(
     level=logging.INFO,
@@ -279,9 +281,20 @@ async def main():
     """
     Main entry point -- connects, collects telemetry, and runs the mission.
 
-    This orchestrates two concurrent activities:
+    This orchestrates three concurrent activities:
     1. Telemetry collection (runs the entire time)
     2. Mission execution (runs the flight plan)
+    3. Optional fault scenario (runs in background if FAULT_SCENARIO is set)
+
+    A FaultInjector is created in this process so that injected faults are
+    recorded in its fault_events list and persisted into the output JSON.
+
+    Note: Faults injected from a *separate* process (e.g., the interactive
+    fault_injector CLI) will affect PX4 behavior and show up in telemetry,
+    but will NOT appear in faults_injected because that process has its own
+    FaultInjector instance. To get faults into the JSON, either:
+    - Set FAULT_SCENARIO env var (s1, s2, s3, s4) to run a built-in scenario
+    - Or extend this runner to accept fault commands programmatically
 
     When the mission finishes, telemetry collection stops and
     everything is saved to a JSON file.
@@ -292,6 +305,7 @@ async def main():
     mission_id = os.getenv("MISSION_ID", f"mission_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     drone_id = os.getenv("DRONE_ID", "tars-sim-01")
     output_dir = os.getenv("OUTPUT_DIR", "output")
+    fault_scenario = os.getenv("FAULT_SCENARIO", "")
 
     logger.info("=" * 60)
     logger.info("TARS Phase 1 -- Mission Runner")
@@ -301,6 +315,8 @@ async def main():
     logger.info(f"Connection:  {connection_str}")
     logger.info(f"Rate:        {rate_hz} Hz")
     logger.info(f"Output:      {output_dir}/")
+    if fault_scenario:
+        logger.info(f"Fault:       scenario {fault_scenario}")
     logger.info("=" * 60)
 
     # Connect to PX4 SITL
@@ -318,6 +334,9 @@ async def main():
         drone_id=drone_id,
     )
 
+    # Create fault injector -- tracks fault events for the mission output
+    injector = FaultInjector(drone)
+
     # Record mission start time
     start_time = datetime.now(timezone.utc)
 
@@ -333,6 +352,29 @@ async def main():
     # Give telemetry streams a moment to initialize
     await asyncio.sleep(2)
 
+    # If a fault scenario was requested, launch it as a background task
+    # The scenario runs concurrently with the mission, injecting faults
+    # at timed intervals. Because it uses the same injector instance,
+    # all fault events are captured in injector.fault_events.
+    fault_task = None
+    if fault_scenario:
+        scenarios = FaultScenarios(injector)
+        scenario_map = {
+            "s1": scenarios.scenario_gps_degradation,
+            "s2": scenarios.scenario_altitude_confusion,
+            "s3": scenarios.scenario_sensor_cascade,
+            "s4": scenarios.scenario_wind_shear,
+        }
+        scenario_fn = scenario_map.get(fault_scenario.lower())
+        if scenario_fn:
+            logger.info(f"Launching fault scenario {fault_scenario} in background...")
+            fault_task = asyncio.create_task(scenario_fn(delay_seconds=10))
+        else:
+            logger.warning(
+                f"Unknown fault scenario '{fault_scenario}'. "
+                f"Valid options: {', '.join(scenario_map.keys())}"
+            )
+
     # Run the mission
     try:
         mission_result = await run_mission(drone)
@@ -340,6 +382,14 @@ async def main():
     except Exception as e:
         logger.error(f"Mission failed: {e}")
         mission_result = MissionResult.FAILURE
+
+    # Cancel fault scenario if still running
+    if fault_task and not fault_task.done():
+        fault_task.cancel()
+        try:
+            await fault_task
+        except asyncio.CancelledError:
+            pass
 
     # Stop telemetry collection
     collector.stop()
@@ -353,10 +403,12 @@ async def main():
     end_time = datetime.now(timezone.utc)
 
     # Build and save the complete mission telemetry
+    # Pass fault events from the injector into the mission output
     mission_telemetry = collector.build_mission_telemetry(
         start_time=start_time,
         end_time=end_time,
         result=mission_result,
+        faults=injector.fault_events,
     )
 
     filepath = collector.save_to_file(mission_telemetry, output_dir=output_dir)
@@ -373,8 +425,13 @@ async def main():
         logger.info(f"  Distance:        {s.distance_traveled_m:.1f}m")
         logger.info(f"  Min battery:     {s.min_battery_percent:.1f}%")
         logger.info(f"  Max speed:       {s.max_speed_m_s:.1f} m/s")
+        logger.info(f"  Faults injected: {len(injector.fault_events)}")
         logger.info(f"  Output file:     {filepath}")
         logger.info("=" * 60)
+
+    # Restore any injected faults to leave simulation in clean state
+    if injector.fault_events:
+        await injector.restore_all()
 
 
 if __name__ == "__main__":
