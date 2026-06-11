@@ -72,6 +72,25 @@ services:
       timeout: 5s
       retries: 5
 
+  # ===========================================================================
+  # Phase 3 -- Redis (Operational State Store)
+  # ===========================================================================
+  # Low-latency store for computed mission state snapshots.
+  # Phase 3 State Engine writes current state, timelines, and processing
+  # metadata here. Not the historical source of truth -- PostgreSQL remains
+  # the durable mission history.
+  redis:
+    image: redis:7-alpine
+    container_name: tars-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
 volumes:
   tars-pgdata:
     driver: local

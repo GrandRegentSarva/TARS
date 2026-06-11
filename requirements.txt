@@ -44,9 +44,16 @@ psycopg2-binary>=2.9.0
 # Alembic -- Database migration tool for SQLAlchemy
 alembic>=1.13.0
 
-# httpx -- Async HTTP client (used for testing FastAPI)
+# httpx -- Async HTTP client (used for testing FastAPI and Phase 3 replay client)
 httpx>=0.27.0
 
 # pytest + pytest-asyncio -- Testing framework
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+
+# ---------------------------------------------------------------------------
+# Phase 3 -- State Engine
+# ---------------------------------------------------------------------------
+
+# Redis -- Async client for operational state store
+redis>=5.0.0
