@@ -7,6 +7,12 @@ Start with:
     PYTHONPATH=src uvicorn tars.phase5.api:app --host 0.0.0.0 --port 8004
 
 API base path: /api/v1
+
+Phase 6 integration:
+- Tracing is initialized during API startup and flushed during shutdown.
+- Phoenix status is reported in the health endpoint.
+- Phase 5 remains independently runnable when Phase 6 dependencies
+  or Phoenix infrastructure are unavailable.
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ _store: Optional[ReasoningStore] = None
 _service: Optional[ReasoningService] = None
 _incident_client: Optional[IncidentClient] = None
 _provider: Optional[object] = None
+_tracing_initialized: bool = False
 
 
 def get_service() -> ReasoningService:
@@ -53,56 +60,149 @@ def get_service() -> ReasoningService:
 
 
 # ---------------------------------------------------------------------------
+# Tracing Lifecycle Helpers
+# ---------------------------------------------------------------------------
+
+def _init_tracing() -> bool:
+    """
+    Initialize Phase 6 tracing if available.
+
+    Returns True if tracing was successfully initialized with a real
+    provider, False otherwise.
+    """
+    try:
+        from tars.phase6.tracing import init_tracing, is_tracing_active
+
+        init_tracing()
+        active = is_tracing_active()
+        if active:
+            logger.info("Phase 6 Phoenix tracing initialized")
+        else:
+            logger.info("Phase 6 tracing disabled or using no-op provider")
+        return active
+    except ImportError:
+        logger.info(
+            "Phase 6 not available; running without Phoenix tracing"
+        )
+        return False
+    except Exception as exc:
+        logger.warning(
+            "Phase 6 tracing initialization failed: %s. "
+            "Continuing without tracing.",
+            exc,
+        )
+        return False
+
+
+def _shutdown_tracing() -> None:
+    """Flush and shut down Phase 6 tracing if available."""
+    try:
+        from tars.phase6.tracing import shutdown_tracing
+
+        shutdown_tracing()
+        logger.info("Phase 6 Phoenix tracing shut down")
+    except ImportError:
+        pass
+    except Exception as exc:
+        logger.warning("Phase 6 tracing shutdown warning: %s", exc)
+
+
+async def _get_phoenix_status() -> str:
+    """
+    Return the current Phoenix tracing status for the health endpoint.
+
+    Verifies actual Phoenix connectivity when tracing is active,
+    rather than just checking whether the tracer provider was created.
+
+    Returns:
+        'ok', 'disabled', or 'unavailable'.
+    """
+    try:
+        from tars.phase6.config import phoenix_settings
+        from tars.phase6.tracing import is_tracing_active
+
+        if not phoenix_settings.is_tracing_enabled:
+            return "disabled"
+        if not is_tracing_active():
+            return "unavailable"
+
+        # Verify Phoenix is actually reachable
+        try:
+            endpoint = phoenix_settings.ENDPOINT.rstrip("/")
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                resp = await client.get(endpoint)
+                # Phoenix returns 200 on its root or health endpoint
+                if resp.status_code < 500:
+                    return "ok"
+                return "unavailable"
+        except Exception:
+            return "unavailable"
+    except ImportError:
+        return "disabled"
+    except Exception:
+        return "unavailable"
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage Redis connection and provider lifecycle."""
-    global _store, _service, _incident_client, _provider
+    """Manage Redis connection, provider lifecycle, and tracing."""
+    global _store, _service, _incident_client, _provider, _tracing_initialized
 
-    _store = ReasoningStore()
-    await _store.connect()
+    # Initialize Phase 6 tracing before handling requests
+    _tracing_initialized = _init_tracing()
 
-    _incident_client = IncidentClient()
-
-    # Try to create the Gemini provider; fall back gracefully
     try:
-        from .agent import create_reasoning_agent
-        from .provider import GeminiReasoningProvider
+        _store = ReasoningStore()
+        await _store.connect()
 
-        if settings.GEMINI_API_KEY:
-            agent = create_reasoning_agent()
-            _provider = GeminiReasoningProvider(agent)
-            logger.info("Gemini provider configured: %s", settings.GEMINI_MODEL)
-        else:
+        _incident_client = IncidentClient()
+
+        # Try to create the Gemini provider; fall back gracefully
+        try:
+            from .agent import create_reasoning_agent
+            from .provider import GeminiReasoningProvider
+
+            if settings.GEMINI_API_KEY:
+                agent = create_reasoning_agent()
+                _provider = GeminiReasoningProvider(agent)
+                logger.info("Gemini provider configured: %s", settings.GEMINI_MODEL)
+            else:
+                logger.warning(
+                    "GEMINI_API_KEY not set; Gemini provider unconfigured. "
+                    "Analysis endpoints will return configuration errors."
+                )
+                _provider = _create_unconfigured_provider()
+        except ImportError as exc:
             logger.warning(
-                "GEMINI_API_KEY not set; Gemini provider unconfigured. "
-                "Analysis endpoints will return configuration errors."
+                "Google ADK not available: %s. "
+                "Using unconfigured provider stub.",
+                exc,
             )
             _provider = _create_unconfigured_provider()
-    except ImportError as exc:
-        logger.warning(
-            "Google ADK not available: %s. "
-            "Using unconfigured provider stub.",
-            exc,
+
+        _service = ReasoningService(
+            store=_store,
+            incident_client=_incident_client,
+            provider=_provider,
         )
-        _provider = _create_unconfigured_provider()
 
-    _service = ReasoningService(
-        store=_store,
-        incident_client=_incident_client,
-        provider=_provider,
-    )
+        logger.info("Phase 5 Reasoning API started")
+        logger.info("Redis: %s", settings.REDIS_URL)
+        logger.info("Phase 4 API: %s", settings.PHASE4_API_URL)
 
-    logger.info("Phase 5 Reasoning API started")
-    logger.info("Redis: %s", settings.REDIS_URL)
-    logger.info("Phase 4 API: %s", settings.PHASE4_API_URL)
+        yield
 
-    yield
+    finally:
+        # Shutdown: flush tracing, then close Redis.
+        # try/finally ensures tracing cleanup even if startup fails.
+        _shutdown_tracing()
 
-    if _store is not None:
-        await _store.close()
-    logger.info("Phase 5 Reasoning API stopped")
+        if _store is not None:
+            await _store.close()
+        logger.info("Phase 5 Reasoning API stopped")
 
 
 def _create_unconfigured_provider():
@@ -134,7 +234,7 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Return API, Redis, Phase 4, and Gemini readiness."""
+    """Return API, Redis, Phase 4, Gemini, and Phoenix readiness."""
     redis_ok = False
     if _store is not None:
         redis_ok = await _store.ping()
@@ -148,11 +248,14 @@ async def health():
         if _provider.is_configured():
             gemini_status = "ok"
 
+    phoenix_status = await _get_phoenix_status()
+
     return HealthResponse(
         status="ok",
         redis="ok" if redis_ok else "unavailable",
         phase4="ok" if phase4_ok else "unavailable",
         gemini=gemini_status,
+        phoenix=phoenix_status,
     )
 
 

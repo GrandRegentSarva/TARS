@@ -194,6 +194,7 @@ class HealthResponse(BaseModel):
     redis: str = "ok"
     phase4: str = "ok"
     gemini: str = "ok"
+    phoenix: str = "disabled"
 
 
 # =============================================================================
