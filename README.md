@@ -14,9 +14,9 @@ Built with: PX4, Gazebo, MAVSDK, Python (future: Gemini, Phoenix, Neo4j)
 
 ---
 
-## Current Status: Phase 5 -- Gemini Reasoning Layer
+## Current Status: Phase 6 -- Phoenix Integration
 
-Phase 5 analyzes bounded Phase 4 incidents using Google Gemini (via Google ADK) to produce structured, advisory root-cause assessments and recommendations. Phase 5 is an analysis layer only -- it never issues flight commands, modifies mission state, or participates in the flight-critical control path.
+Phase 6 instruments the Phase 5 Gemini Reasoning Layer with OpenTelemetry tracing and exports spans to [Arize Phoenix](https://phoenix.arize.com/) for LLM observability. Every reasoning decision produces a structured trace with parent-child span hierarchy, OpenInference semantic conventions, and configurable content capture modes.
 
 ### What's Working
 
@@ -163,7 +163,9 @@ TARS/
 |   |-- phase-1-mission-foundation.md
 |   |-- phase-2-mission-replay-system.md
 |   |-- phase-3-state-engine.md
-|   +-- phase-4-incident-engine.md
+|   |-- phase-4-incident-engine.md
+|   |-- phase-5-gemini-reasoning-layer.md
+|   +-- phase-6-phoenix-integration.md
 |-- docker/                             # Docker setup
 |   |-- Dockerfile.px4-sitl             # PX4 SITL + Gazebo headless
 |   +-- docker-compose.yml              # PX4 SITL + PostgreSQL + Redis
@@ -205,16 +207,20 @@ TARS/
 |       |   |-- store.py               # Async Redis incident store
 |       |   |-- state_client.py        # HTTP client for Phase 3 API
 |       |   +-- service.py             # Detection orchestration
-|       +-- phase5/                     # Phase 5 -- Gemini Reasoning Layer
-|           |-- api.py                  # FastAPI app (port 8004)
-|           |-- config.py              # Environment settings
-|           |-- models.py              # Reasoning schemas and provider protocol
-|           |-- prompts.py             # Versioned system instruction and prompt
-|           |-- agent.py               # Google ADK Gemini agent configuration
-|           |-- provider.py            # Gemini + fake reasoning providers
-|           |-- incident_client.py     # HTTP client for Phase 4 API
-|           |-- store.py               # Async Redis reasoning store
-|           +-- service.py             # Reasoning orchestration
+|       |-- phase5/                     # Phase 5 -- Gemini Reasoning Layer
+|       |   |-- api.py                  # FastAPI app (port 8004)
+|       |   |-- config.py              # Environment settings
+|       |   |-- models.py              # Reasoning schemas and provider protocol
+|       |   |-- prompts.py             # Versioned system instruction and prompt
+|       |   |-- agent.py               # Google ADK Gemini agent configuration
+|       |   |-- provider.py            # Gemini + fake reasoning providers
+|       |   |-- incident_client.py     # HTTP client for Phase 4 API
+|       |   |-- store.py               # Async Redis reasoning store
+|       |   +-- service.py             # Reasoning orchestration
+|       +-- phase6/                     # Phase 6 -- Phoenix Integration
+|           |-- config.py              # PhoenixSettings (env-driven)
+|           |-- attributes.py          # Stable trace attribute constants
+|           +-- tracing.py             # TracerProvider setup, OTLP exporter
 |-- migrations/                         # Alembic database migrations
 |   |-- env.py
 |   +-- versions/
@@ -246,14 +252,18 @@ TARS/
 |   |   |-- test_detector.py
 |   |   |-- test_store.py
 |   |   +-- test_api.py
-|   +-- phase5/                         # Phase 5 tests
-|       |-- test_models.py
-|       |-- test_prompts.py
-|       |-- test_client.py
-|       |-- test_provider.py
-|       |-- test_store.py
-|       |-- test_service.py
-|       +-- test_api.py
+|   |-- phase5/                         # Phase 5 tests
+|   |   |-- test_models.py
+|   |   |-- test_prompts.py
+|   |   |-- test_client.py
+|   |   |-- test_provider.py
+|   |   |-- test_store.py
+|   |   |-- test_service.py
+|   |   +-- test_api.py
+|   +-- phase6/                         # Phase 6 tests
+|       |-- test_config.py              # 31 configuration tests
+|       |-- test_tracing.py             # 14 tracing bootstrap tests
+|       +-- test_reasoning_traces.py    # 44 reasoning trace tests
 |-- output/                             # Telemetry JSON files
 |-- alembic.ini                         # Alembic configuration
 |-- pytest.ini                          # Pytest configuration
@@ -691,6 +701,17 @@ Edit `.env` or set environment variables:
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model identifier |
 | `GEMINI_TEMPERATURE` | `0.1` | Gemini temperature (low for stable reasoning) |
 
+### Phase 6
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PHOENIX_ENABLED` | `true` | Enable/disable Phoenix tracing |
+| `PHOENIX_ENDPOINT` | `http://localhost:6006` | Phoenix OTLP endpoint |
+| `PHOENIX_PROJECT_NAME` | `tars-reasoning` | Phoenix project name |
+| `PHOENIX_CONTENT_MODE` | `full` | Content capture: `full`, `metadata`, `disabled` |
+| `PHOENIX_EXPORT_TIMEOUT_SECONDS` | `5` | OTLP export timeout |
+| `PHOENIX_BATCH_EXPORT` | `true` | Use batch span processor |
+
 ---
 
 ## Hardware Notes
@@ -713,8 +734,8 @@ Gazebo runs in **headless mode** (no 3D rendering) to fit within RAM constraints
 | 2 | Mission Replay System (FastAPI + PostgreSQL) | ✅ Done |
 | 3 | State Engine (Python + Redis) | ✅ Done |
 | 4 | Incident Engine (Rules + Statistical Detection) | ✅ Done |
-| 5 | Gemini Reasoning Layer (Google ADK) | ✅ Current |
-| 6 | Phoenix Integration (OpenInference Tracing) | Next |
+| 5 | Gemini Reasoning Layer (Google ADK) | ✅ Done |
+| 6 | Phoenix Integration (OpenInference Tracing) | ✅ Current |
 | 7 | Neo4j Operational Memory | Planned |
 | 8 | Phoenix MCP (Self-Introspection) | Planned |
 | 9 | Evaluation Layer | Planned |
