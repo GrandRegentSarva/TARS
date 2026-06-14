@@ -67,3 +67,18 @@ google-adk>=1.0.0
 
 # Google GenAI -- Gemini SDK types and client
 google-genai>=1.0.0
+
+# ---------------------------------------------------------------------------
+# Phase 6 -- Phoenix Integration (Observability)
+# ---------------------------------------------------------------------------
+
+# OpenTelemetry -- Distributed tracing framework
+opentelemetry-api>=1.20.0
+opentelemetry-sdk>=1.20.0
+
+# OTLP HTTP exporter -- Exports spans to Phoenix via OTLP/HTTP
+opentelemetry-exporter-otlp-proto-http>=1.20.0
+
+# arize-phoenix -- Phoenix observability platform (optional, for local server)
+# Install separately if running Phoenix locally:
+#   pip install arize-phoenix
