@@ -10,7 +10,7 @@
 
 TARS is a runtime feedback system for autonomous drones. It lets drone agents continuously **trace, evaluate, and introspect** their own behavior — detecting telemetry anomalies, decision inconsistencies, and mission failures to iteratively refine future actions.
 
-Built with PX4, Gazebo, MAVSDK, Python, Gemini, Phoenix, and Redis.
+Built with PX4, Gazebo, MAVSDK, Python, Gemini, Phoenix, Neo4j, and Redis.
 
 ---
 
@@ -26,6 +26,7 @@ TARS is organized as a layered pipeline. Each layer builds on the one below it:
 | **Phase 4 — Incident Engine** | Evaluates state timelines against 7 rule types across 4 severity levels. Collapses consecutive matches into bounded incidents with gap-based merging and persistence thresholds. | 8003 |
 | **Phase 5 — Gemini Reasoning** | Analyzes bounded incidents using Google Gemini (via ADK) to produce structured, advisory-only root-cause assessments. Provider-neutral interface with versioned prompts and control-command rejection at the model boundary. | 8004 |
 | **Phase 6 — Phoenix Integration** | Instruments the reasoning layer with OpenTelemetry tracing and exports spans to [Arize Phoenix](https://phoenix.arize.com/). Produces parent-child span hierarchies with OpenInference semantic conventions and configurable content capture (full / metadata / disabled). | — |
+| **Phase 7 — Operational Memory** | Projects bounded facts from Phases 2, 4, and 5 into a Neo4j graph. Connects missions → incidents → root causes → mitigations → outcomes. Answers "Have we seen this before?" with provenance-preserving history queries. | 8005 |
 
 Each phase has its own FastAPI service, test suite, and configuration. Phases communicate over HTTP — no shared databases, no tight coupling.
 
@@ -116,10 +117,11 @@ TARS/
 |   |-- phase-3-state-engine.md
 |   |-- phase-4-incident-engine.md
 |   |-- phase-5-gemini-reasoning-layer.md
-|   +-- phase-6-phoenix-integration.md
+|   |-- phase-6-phoenix-integration.md
+|   +-- phase-7-neo4j-operational-memory.md
 |-- docker/                             # Docker setup
 |   |-- Dockerfile.px4-sitl             # PX4 SITL + Gazebo headless
-|   +-- docker-compose.yml              # PX4 SITL + PostgreSQL + Redis
+|   +-- docker-compose.yml              # PX4 SITL + PostgreSQL + Redis + Neo4j
 |-- src/
 |   +-- tars/
 |       |-- phase1/                     # Phase 1 -- Mission Foundation
@@ -168,10 +170,22 @@ TARS/
 |       |   |-- incident_client.py     # HTTP client for Phase 4 API
 |       |   |-- store.py               # Async Redis reasoning store
 |       |   +-- service.py             # Reasoning orchestration
-|       +-- phase6/                     # Phase 6 -- Phoenix Integration
-|           |-- config.py              # PhoenixSettings (env-driven)
-|           |-- attributes.py          # Stable trace attribute constants
-|           +-- tracing.py             # TracerProvider setup, OTLP exporter
+|       |-- phase6/                     # Phase 6 -- Phoenix Integration
+|       |   |-- config.py              # PhoenixSettings (env-driven)
+|       |   |-- attributes.py          # Stable trace attribute constants
+|       |   +-- tracing.py             # TracerProvider setup, OTLP exporter
+|       +-- phase7/                     # Phase 7 -- Operational Memory
+|           |-- api.py                  # FastAPI app (port 8005)
+|           |-- config.py              # Environment settings
+|           |-- models.py              # Graph models, enums, request/response
+|           |-- database.py            # Async Neo4j driver lifecycle
+|           |-- schema.py             # Constraints and indexes
+|           |-- mapper.py             # Pure mapping + deterministic IDs
+|           |-- repository.py         # Graph MERGE/MATCH operations
+|           |-- service.py            # Sync + query orchestration
+|           |-- phase2_client.py      # HTTP client for Phase 2 API
+|           |-- phase4_client.py      # HTTP client for Phase 4 API
+|           +-- phase5_client.py      # HTTP client for Phase 5 API
 |-- migrations/                         # Alembic database migrations
 |   |-- env.py
 |   +-- versions/
@@ -185,7 +199,10 @@ TARS/
 |   |-- start_incident_api.sh           # Start Phase 4 Incident API server
 |   |-- process_mission_incidents.sh    # Detect incidents for a mission
 |   |-- start_reasoning_api.sh          # Start Phase 5 Reasoning API server
-|   +-- analyze_incident.sh            # Analyze an incident through Phase 5
+|   |-- analyze_incident.sh            # Analyze an incident through Phase 5
+|   |-- start_memory_api.sh            # Start Phase 7 Memory API server
+|   |-- sync_mission_memory.sh         # Sync a mission into Neo4j graph
+|   +-- query_similar_incidents.sh     # Query similar historical incidents
 |-- tests/
 |   |-- phase2/                         # Phase 2 tests
 |   |   |-- test_importer.py
@@ -211,10 +228,17 @@ TARS/
 |   |   |-- test_store.py
 |   |   |-- test_service.py
 |   |   +-- test_api.py
-|   +-- phase6/                         # Phase 6 tests
-|       |-- test_config.py              # 31 configuration tests
-|       |-- test_tracing.py             # 14 tracing bootstrap tests
-|       +-- test_reasoning_traces.py    # 44 reasoning trace tests
+|   |-- phase6/                         # Phase 6 tests
+|   |   |-- test_config.py              # 31 configuration tests
+|   |   |-- test_tracing.py             # 14 tracing bootstrap tests
+|   |   +-- test_reasoning_traces.py    # 44 reasoning trace tests
+|   +-- phase7/                         # Phase 7 tests
+|       |-- test_models.py              # Model validation tests
+|       |-- test_mapper.py              # Mapping + deterministic ID tests
+|       |-- test_clients.py             # Upstream HTTP client tests
+|       |-- test_repository.py          # Graph operation tests
+|       |-- test_service.py             # Service orchestration tests
+|       +-- test_api.py                 # API endpoint tests
 |-- output/                             # Telemetry JSON files
 |-- alembic.ini                         # Alembic configuration
 |-- pytest.ini                          # Pytest configuration
@@ -508,6 +532,109 @@ PYTHONPATH=src .venv/bin/pytest tests/phase5/ -v
 
 ---
 
+## Phase 7 -- Operational Memory
+
+Phase 7 projects bounded facts from Phases 2, 4, and 5 into a Neo4j graph database. It connects missions → incidents → root causes → mitigations → outcomes and answers "Have we seen this before?" with provenance-preserving history queries.
+
+### 1. Start Neo4j and Upstream APIs
+
+```bash
+# Start Neo4j (+ PostgreSQL and Redis for upstream phases)
+docker compose -f docker/docker-compose.yml up neo4j postgres redis -d
+
+# Start Phase 2 + Phase 3 + Phase 4 + Phase 5 APIs
+./scripts/start_replay_api.sh &
+./scripts/start_state_api.sh &
+./scripts/start_incident_api.sh &
+./scripts/start_reasoning_api.sh &
+```
+
+### 2. Configure Neo4j
+
+```bash
+# Set your Neo4j password in .env (must match docker-compose)
+echo "NEO4J_PASSWORD=tars" >> .env
+
+# Or export directly
+export NEO4J_PASSWORD=tars
+```
+
+> **Note:** The default Docker Compose configuration sets the Neo4j password to `tars`. Schema constraints and indexes are created automatically on API startup.
+
+### 3. Start the Memory API
+
+```bash
+./scripts/start_memory_api.sh
+
+# API docs available at http://localhost:8005/docs
+# Health check at http://localhost:8005/health
+```
+
+### 4. Sync a Mission
+
+```bash
+# Via the script (requires upstream APIs running)
+./scripts/sync_mission_memory.sh mission_20260608_120000
+
+# Or via curl
+curl -X POST http://localhost:8005/api/v1/memory/sync \
+  -H "Content-Type: application/json" \
+  -d '{"mission_id": "mission_20260608_120000"}'
+
+# Check sync status
+curl http://localhost:8005/api/v1/memory/sync/mission_20260608_120000
+```
+
+### 5. Query Operational Memory
+
+```bash
+# Get incident neighborhood (root causes, mitigations, outcomes)
+curl http://localhost:8005/api/v1/memory/incidents/inc_abc123
+
+# Find similar historical incidents
+curl "http://localhost:8005/api/v1/memory/incidents/inc_abc123/similar?limit=10"
+
+# Or via the script
+./scripts/query_similar_incidents.sh inc_abc123
+```
+
+### 6. Record Mitigations and Outcomes
+
+```bash
+# Record an applied mitigation
+curl -X POST http://localhost:8005/api/v1/memory/mitigations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "incident_id": "inc_abc123",
+    "mitigation_text": "Switched to backup GPS receiver",
+    "applied_by": "operator"
+  }'
+
+# Record an outcome
+curl -X POST http://localhost:8005/api/v1/memory/outcomes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "incident_id": "inc_abc123",
+    "status": "recovered",
+    "description": "GPS signal restored after switching to backup receiver",
+    "mitigation_application_id": "ma_xyz789"
+  }'
+```
+
+### 7. Run Tests
+
+```bash
+# All Phase 7 tests (no Neo4j required -- all graph operations are mocked)
+PYTHONPATH=src .venv/bin/pytest tests/phase7/ -v
+
+# Individual test modules
+PYTHONPATH=src .venv/bin/pytest tests/phase7/test_models.py tests/phase7/test_mapper.py -v
+PYTHONPATH=src .venv/bin/pytest tests/phase7/test_clients.py tests/phase7/test_repository.py -v
+PYTHONPATH=src .venv/bin/pytest tests/phase7/test_service.py tests/phase7/test_api.py -v
+```
+
+---
+
 ## Telemetry Output Format
 
 Each mission produces a JSON file in `output/`:
@@ -663,6 +790,23 @@ Edit `.env` or set environment variables:
 | `PHOENIX_EXPORT_TIMEOUT_SECONDS` | `5` | OTLP export timeout |
 | `PHOENIX_BATCH_EXPORT` | `true` | Use batch span processor |
 
+### Phase 7
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j Bolt connection URI |
+| `NEO4J_USER` | `neo4j` | Neo4j username |
+| `NEO4J_PASSWORD` | *(empty)* | Neo4j password |
+| `NEO4J_DATABASE` | `neo4j` | Neo4j database name |
+| `MEMORY_API_HOST` | `0.0.0.0` | Memory API server host |
+| `MEMORY_API_PORT` | `8005` | Memory API server port |
+| `PHASE2_API_URL` | `http://localhost:8000` | Phase 2 Replay API base URL |
+| `PHASE4_API_URL` | `http://localhost:8003` | Phase 4 Incident API base URL |
+| `PHASE5_API_URL` | `http://localhost:8004` | Phase 5 Reasoning API base URL |
+| `MEMORY_CLIENT_TIMEOUT` | `30.0` | HTTP client timeout for upstream calls |
+| `MEMORY_QUERY_DEFAULT_LIMIT` | `20` | Default result limit for queries |
+| `MEMORY_QUERY_MAX_LIMIT` | `100` | Maximum result limit for queries |
+
 ---
 
 ## Hardware Notes
@@ -686,8 +830,8 @@ Gazebo runs in **headless mode** (no 3D rendering) to fit within RAM constraints
 | 3 | State Engine (Python + Redis) | ✅ Done |
 | 4 | Incident Engine (Rules + Statistical Detection) | ✅ Done |
 | 5 | Gemini Reasoning Layer (Google ADK) | ✅ Done |
-| 6 | Phoenix Integration (OpenInference Tracing) | ✅ Current |
-| 7 | Neo4j Operational Memory | Planned |
+| 6 | Phoenix Integration (OpenInference Tracing) | ✅ Done |
+| 7 | Neo4j Operational Memory | ✅ Current |
 | 8 | Phoenix MCP (Self-Introspection) | Planned |
 | 9 | Evaluation Layer | Planned |
 | 10 | Learning Engine | Planned |

@@ -82,3 +82,10 @@ opentelemetry-exporter-otlp-proto-http>=1.20.0
 # arize-phoenix -- Phoenix observability platform (optional, for local server)
 # Install separately if running Phoenix locally:
 #   pip install arize-phoenix
+
+# ---------------------------------------------------------------------------
+# Phase 7 -- Neo4j Operational Memory
+# ---------------------------------------------------------------------------
+
+# Neo4j -- Official async Python driver for Neo4j graph database
+neo4j>=5.0.0

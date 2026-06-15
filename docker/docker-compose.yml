@@ -91,6 +91,36 @@ services:
       timeout: 5s
       retries: 5
 
+  # ===========================================================================
+  # Phase 7 -- Neo4j (Operational Memory Graph)
+  # ===========================================================================
+  # Graph database for operational memory connecting missions, incidents,
+  # root causes, mitigations, and outcomes. Phase 7 projects bounded facts
+  # from Phases 2, 4, and 5 without replacing their source systems.
+  #
+  # Neo4j may be unavailable without affecting mission execution, replay,
+  # incident detection, reasoning, or Phoenix tracing.
+  neo4j:
+    image: neo4j:5-community
+    container_name: tars-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-tarsneo4j}
+      NEO4J_PLUGINS: '[]'
+    ports:
+      - "7474:7474"   # HTTP browser
+      - "7687:7687"   # Bolt protocol
+    volumes:
+      - tars-neo4j-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
 volumes:
   tars-pgdata:
+    driver: local
+  tars-neo4j-data:
     driver: local
