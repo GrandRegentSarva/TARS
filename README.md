@@ -8,75 +8,26 @@
 
 ## What Is TARS?
 
-TARS is a runtime feedback system for autonomous drones. It lets drone agents continuously **trace, evaluate, and introspect** their own behavior -- detecting telemetry anomalies, decision inconsistencies, and mission failures to iteratively refine future actions.
+TARS is a runtime feedback system for autonomous drones. It lets drone agents continuously **trace, evaluate, and introspect** their own behavior — detecting telemetry anomalies, decision inconsistencies, and mission failures to iteratively refine future actions.
 
-Built with: PX4, Gazebo, MAVSDK, Python (future: Gemini, Phoenix, Neo4j)
+Built with PX4, Gazebo, MAVSDK, Python, Gemini, Phoenix, and Redis.
 
 ---
 
-## Current Status: Phase 6 -- Phoenix Integration
+## Architecture
 
-Phase 6 instruments the Phase 5 Gemini Reasoning Layer with OpenTelemetry tracing and exports spans to [Arize Phoenix](https://phoenix.arize.com/) for LLM observability. Every reasoning decision produces a structured trace with parent-child span hierarchy, OpenInference semantic conventions, and configurable content capture modes.
+TARS is organized as a layered pipeline. Each layer builds on the one below it:
 
-### What's Working
+| Layer | What It Does | Port |
+|-------|-------------|------|
+| **Phase 1 — Mission Foundation** | Runs PX4 SITL + Gazebo headless simulations, collects async telemetry via MAVSDK, injects faults (GPS block, battery drain, sensor cascade, etc.), and writes structured JSON output. | — |
+| **Phase 2 — Mission Replay** | Imports mission JSON into PostgreSQL, provides ordered replay frames with elapsed timing, and exposes a FastAPI REST API for mission queries. | 8000 |
+| **Phase 3 — State Engine** | Transforms replay frames into classified mission states (phase, health, risk score) and stores them as Redis timelines. Deterministic phase classification and additive risk scoring. | 8002 |
+| **Phase 4 — Incident Engine** | Evaluates state timelines against 7 rule types across 4 severity levels. Collapses consecutive matches into bounded incidents with gap-based merging and persistence thresholds. | 8003 |
+| **Phase 5 — Gemini Reasoning** | Analyzes bounded incidents using Google Gemini (via ADK) to produce structured, advisory-only root-cause assessments. Provider-neutral interface with versioned prompts and control-command rejection at the model boundary. | 8004 |
+| **Phase 6 — Phoenix Integration** | Instruments the reasoning layer with OpenTelemetry tracing and exports spans to [Arize Phoenix](https://phoenix.arize.com/). Produces parent-child span hierarchies with OpenInference semantic conventions and configurable content capture (full / metadata / disabled). | — |
 
-**Phase 1 -- Mission Foundation:**
-- [x] PX4 SITL + Gazebo headless simulation (Docker)
-- [x] MAVSDK async telemetry collection (position, battery, GPS, attitude, health)
-- [x] Autonomous mission execution (takeoff -> waypoints -> land)
-- [x] Fault injection (GPS block, GPS noise, battery drain, baro offset, mag offset)
-- [x] Structured JSON telemetry output with Pydantic models
-- [x] Pre-built fault scenarios (GPS degradation, altitude confusion, sensor cascade)
-
-**Phase 2 -- Mission Replay System:**
-- [x] PostgreSQL mission store (Docker Compose)
-- [x] Alembic database migrations
-- [x] Mission import from Phase 1 JSON (validated through MissionTelemetry model)
-- [x] Idempotent import with overwrite control
-- [x] FastAPI REST API (mission listing, detail, events, replay)
-- [x] Ordered replay frames with elapsed timing metadata
-- [x] Fault event persistence and retrieval
-- [x] Tests for importer, replay, and API endpoints
-
-**Phase 3 -- State Engine:**
-- [x] Deterministic mission phase classification (preflight, takeoff, climb, cruise, RTL, landing, landed)
-- [x] Health assessment (nominal, degraded, critical, unknown)
-- [x] Additive risk scoring (0.0–1.0) with weighted GPS, battery, health, and attitude signals
-- [x] Redis state store (current state, timeline sorted set, processing metadata)
-- [x] Composite timeline scores for stable ordering at equal elapsed times
-- [x] Partial replay protection (current state only updated on full replays)
-- [x] Processing status tracking (complete, partial, failed)
-- [x] FastAPI REST API on port 8002 (process, current state, timeline, state-at-time, status)
-- [x] Async HTTP client for Phase 2 replay data
-- [x] 83 tests (pure logic + Redis integration)
-
-**Phase 4 -- Incident Engine:**
-- [x] 7 deterministic incident types (navigation, battery, attitude, altitude, sensor, telemetry, high-risk)
-- [x] 4 severity levels (low, medium, high, critical)
-- [x] Single-state rule evaluation with configurable thresholds
-- [x] Incident collapsing (consecutive matches merged into bounded incidents)
-- [x] Gap-based merging (configurable INCIDENT_MAX_GAP_MS)
-- [x] Persistence thresholds (min_states) with immediate rules for critical events
-- [x] Stable deterministic incident IDs for repeated processing
-- [x] Statistical helpers (rolling mean/stddev, rate of change, oscillation detection)
-- [x] Redis incident store (timeline sorted set, processing metadata)
-- [x] FastAPI REST API on port 8003 (process, list, get, status)
-- [x] Async HTTP client for Phase 3 state timelines
-- [x] 118 tests (rules, statistics, detector, store, API)
-
-**Phase 5 -- Gemini Reasoning Layer:**
-- [x] Advisory root-cause analysis of Phase 4 incidents via Google Gemini (ADK)
-- [x] Structured reasoning output (root cause, confidence, recommendation, rationale, factors, uncertainties)
-- [x] Provider-neutral interface (injectable; tests use deterministic fake provider)
-- [x] Versioned system instruction and incident-only prompts
-- [x] Bounded incident contract (no raw telemetry sent to Gemini)
-- [x] Advisory-only validation (control commands rejected at model boundary)
-- [x] Redis reasoning store (hash per mission, one analysis per incident)
-- [x] Overwrite control (reuse existing analysis or reinvoke Gemini)
-- [x] FastAPI REST API on port 8004 (analyze, get, list, health)
-- [x] Async HTTP client for Phase 4 incidents
-- [x] Graceful startup without Gemini credentials (unconfigured status)
-- [x] Phase 5 tests (models, prompts, client, provider, store, service, API)
+Each phase has its own FastAPI service, test suite, and configuration. Phases communicate over HTTP — no shared databases, no tight coupling.
 
 ---
 
