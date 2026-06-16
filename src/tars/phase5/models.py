@@ -139,6 +139,11 @@ class ReasoningResult(BaseModel):
     created_at: str
     advisory_only: bool = Field(default=True)
 
+    # Phase 8 introspection metadata (safe provenance only)
+    introspection_used: bool = Field(default=False)
+    introspection_trace_ids: list[str] = Field(default_factory=list)
+    introspection_summary: Optional[str] = Field(default=None)
+
     @field_validator("recommendation")
     @classmethod
     def recommendation_must_be_advisory(cls, v: str) -> str:
@@ -161,6 +166,14 @@ class ReasoningResult(BaseModel):
 class AnalyzeRequest(BaseModel):
     """POST /api/v1/reasoning/analyze/{mission_id}/{incident_id} request."""
     overwrite: bool = Field(default=True)
+    use_introspection: bool = Field(
+        default=False,
+        description=(
+            "When True, optionally query Phoenix MCP for prior reasoning "
+            "traces and include bounded introspection context in the "
+            "reasoning prompt. Default False preserves existing behavior."
+        ),
+    )
 
 
 class AnalyzeResponse(BaseModel):
@@ -180,6 +193,11 @@ class AnalyzeResponse(BaseModel):
     created_at: str
     advisory_only: bool = True
 
+    # Phase 8 introspection metadata
+    introspection_used: bool = False
+    introspection_trace_ids: list[str] = Field(default_factory=list)
+    introspection_summary: Optional[str] = None
+
 
 class ReasoningListResponse(BaseModel):
     """GET /api/v1/reasoning/{mission_id} response."""
@@ -195,6 +213,7 @@ class HealthResponse(BaseModel):
     phase4: str = "ok"
     gemini: str = "ok"
     phoenix: str = "disabled"
+    phoenix_mcp: str = "disabled"
 
 
 # =============================================================================

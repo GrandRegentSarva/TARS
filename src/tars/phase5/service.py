@@ -6,16 +6,22 @@ Orchestrates incident retrieval, reasoning, validation, and persistence.
 Service flow:
 1. Check for existing analysis (if overwrite=false, return it).
 2. Fetch the incident from Phase 4.
-3. Invoke the reasoning provider.
-4. Validate the structured response.
-5. Persist and return the result.
-6. On failure, do not persist.
+3. Optionally query Phoenix MCP for prior reasoning traces (Phase 8).
+4. Invoke the reasoning provider.
+5. Validate the structured response.
+6. Persist and return the result.
+7. On failure, do not persist.
 
 Phase 6 tracing:
 Each call to analyze_incident() creates a root ``reasoning.analyze`` span
 with child spans for cache lookup, incident retrieval, prompt building,
-Gemini invocation, validation, and persistence. Tracing is best-effort
-and never changes return values or exception behavior.
+optional introspection, Gemini invocation, validation, and persistence.
+Tracing is best-effort and never changes return values or exception behavior.
+
+Phase 8 integration:
+When ``use_introspection=True``, the service queries Phoenix MCP for
+bounded prior traces and includes introspection context in the reasoning
+prompt. Phoenix MCP failures never prevent reasoning from completing.
 """
 
 from __future__ import annotations
@@ -91,6 +97,7 @@ class ReasoningService:
         mission_id: str,
         incident_id: str,
         overwrite: bool = True,
+        use_introspection: bool = False,
     ) -> ReasoningResult:
         """
         Analyze a Phase 4 incident through the reasoning provider.
@@ -129,6 +136,7 @@ class ReasoningService:
                     mission_id=mission_id,
                     incident_id=incident_id,
                     overwrite=overwrite,
+                    use_introspection=use_introspection,
                     root_span=root_span,
                     tracer=tracer,
                     attrs=attrs,
@@ -151,6 +159,7 @@ class ReasoningService:
         mission_id: str,
         incident_id: str,
         overwrite: bool,
+        use_introspection: bool = False,
         root_span: trace.Span,
         tracer: trace.Tracer,
         attrs: Any,
@@ -241,6 +250,20 @@ class ReasoningService:
                 incident_span.record_exception(exc)
                 raise
 
+        # --- Phase 8: Optional Introspection ---
+        introspection_context = None
+        introspection_result = None
+        if use_introspection:
+            introspection_context, introspection_result = (
+                await self._run_introspection(
+                    mission_id=mission_id,
+                    incident_id=incident_id,
+                    incident_type=incident.get("incident_type"),
+                    tracer=tracer,
+                    attrs=attrs,
+                )
+            )
+
         # --- Build Prompt ---
         with tracer.start_as_current_span(
             "reasoning.build_prompt"
@@ -254,8 +277,15 @@ class ReasoningService:
         ) as prompt_span:
             try:
                 from .prompts import build_incident_prompt
-                prompt_text = build_incident_prompt(incident)
+                prompt_text = build_incident_prompt(
+                    incident,
+                    introspection_context=introspection_context,
+                )
                 prompt_span.set_attribute("prompt.length", len(prompt_text))
+                if introspection_context is not None:
+                    prompt_span.set_attribute(
+                        "prompt.introspection_included", True
+                    )
             except Exception as exc:
                 prompt_span.set_status(StatusCode.ERROR, str(exc))
                 prompt_span.record_exception(exc)
@@ -283,6 +313,15 @@ class ReasoningService:
                 reasoning_id = f"reason_{uuid.uuid4().hex[:12]}"
                 now = datetime.now(timezone.utc).isoformat()
 
+                # Build introspection metadata for result
+                intro_used = False
+                intro_trace_ids: list[str] = []
+                intro_summary: Optional[str] = None
+                if introspection_result is not None:
+                    intro_used = introspection_result.introspection_used
+                    intro_trace_ids = introspection_result.introspection_trace_ids
+                    intro_summary = introspection_result.introspection_summary
+
                 result = ReasoningResult(
                     reasoning_id=reasoning_id,
                     mission_id=mission_id,
@@ -298,6 +337,9 @@ class ReasoningService:
                     prompt_version=PROMPT_VERSION,
                     created_at=now,
                     advisory_only=True,
+                    introspection_used=intro_used,
+                    introspection_trace_ids=intro_trace_ids,
+                    introspection_summary=intro_summary,
                 )
                 validate_span.set_attribute("validation.passed", True)
             except Exception as exc:
@@ -349,6 +391,42 @@ class ReasoningService:
         )
 
         return result
+
+    async def _run_introspection(
+        self,
+        *,
+        mission_id: str,
+        incident_id: str,
+        incident_type: Optional[str],
+        tracer: trace.Tracer,
+        attrs: Any,
+    ) -> tuple:
+        """
+        Run Phase 8 introspection, returning context and result.
+
+        Fails open: any error returns (None, None) and reasoning continues.
+        """
+        try:
+            from tars.phase8.service import IntrospectionService
+
+            service = IntrospectionService()
+            return await service.build_introspection_context(
+                mission_id=mission_id,
+                incident_id=incident_id,
+                incident_type=incident_type,
+                use_introspection=True,
+            )
+        except ImportError:
+            logger.debug(
+                "Phase 8 not available; skipping introspection"
+            )
+            return None, None
+        except Exception as exc:
+            logger.warning(
+                "Phase 8 introspection failed (continuing without): %s",
+                exc,
+            )
+            return None, None
 
     async def get_analysis(
         self,

@@ -143,6 +143,26 @@ async def _get_phoenix_status() -> str:
         return "unavailable"
 
 
+async def _get_phoenix_mcp_status() -> str:
+    """
+    Return the current Phoenix MCP introspection status.
+
+    Returns:
+        'ok', 'disabled', or 'unavailable'.
+    """
+    try:
+        from tars.phase8.service import IntrospectionService
+
+        service = IntrospectionService()
+        status = await service.health_check()
+        await service.close()
+        return status
+    except ImportError:
+        return "disabled"
+    except Exception:
+        return "unavailable"
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -234,7 +254,7 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Return API, Redis, Phase 4, Gemini, and Phoenix readiness."""
+    """Return API, Redis, Phase 4, Gemini, Phoenix, and Phoenix MCP readiness."""
     redis_ok = False
     if _store is not None:
         redis_ok = await _store.ping()
@@ -249,6 +269,7 @@ async def health():
             gemini_status = "ok"
 
     phoenix_status = await _get_phoenix_status()
+    phoenix_mcp_status = await _get_phoenix_mcp_status()
 
     return HealthResponse(
         status="ok",
@@ -256,6 +277,7 @@ async def health():
         phase4="ok" if phase4_ok else "unavailable",
         gemini=gemini_status,
         phoenix=phoenix_status,
+        phoenix_mcp=phoenix_mcp_status,
     )
 
 
@@ -303,6 +325,9 @@ async def analyze_incident(
                 prompt_version=existing.prompt_version,
                 created_at=existing.created_at,
                 advisory_only=existing.advisory_only,
+                introspection_used=existing.introspection_used,
+                introspection_trace_ids=existing.introspection_trace_ids,
+                introspection_summary=existing.introspection_summary,
             )
 
     # Check provider configuration only when we need to invoke Gemini
@@ -321,6 +346,7 @@ async def analyze_incident(
             mission_id=mission_id,
             incident_id=incident_id,
             overwrite=request.overwrite,
+            use_introspection=request.use_introspection,
         )
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
@@ -380,6 +406,9 @@ async def analyze_incident(
         prompt_version=result.prompt_version,
         created_at=result.created_at,
         advisory_only=result.advisory_only,
+        introspection_used=result.introspection_used,
+        introspection_trace_ids=result.introspection_trace_ids,
+        introspection_summary=result.introspection_summary,
     )
 
 

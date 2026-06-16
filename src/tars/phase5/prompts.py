@@ -15,7 +15,7 @@ Prompt design principles:
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Optional
 
 # Current prompt version -- increment when prompt content changes
 PROMPT_VERSION = "1.0.0"
@@ -66,7 +66,10 @@ Do not include any text outside the JSON object.
 # Incident Prompt Builder
 # ============================================================================
 
-def build_incident_prompt(incident: dict[str, Any]) -> str:
+def build_incident_prompt(
+    incident: dict[str, Any],
+    introspection_context: Optional[Any] = None,
+) -> str:
     """
     Build the incident analysis prompt from a bounded Phase 4 incident.
 
@@ -77,8 +80,12 @@ def build_incident_prompt(incident: dict[str, Any]) -> str:
     - phases
     - evidence (deduplicated)
 
+    When introspection_context is provided (Phase 8), appends bounded
+    prior trace summaries with explicit limitations.
+
     Args:
         incident: Phase 4 incident dict.
+        introspection_context: Optional Phase 8 IntrospectionContext.
 
     Returns:
         Formatted prompt string with incident JSON and task instruction.
@@ -97,6 +104,13 @@ def build_incident_prompt(incident: dict[str, Any]) -> str:
 
     incident_json = json.dumps(bounded, indent=2)
 
+    # Build introspection section if available
+    introspection_section = ""
+    if introspection_context is not None:
+        introspection_section = _build_introspection_section(
+            introspection_context
+        )
+
     return f"""\
 Prompt version: {PROMPT_VERSION}
 
@@ -107,7 +121,7 @@ Incident data:
 ```json
 {incident_json}
 ```
-
+{introspection_section}
 Task:
 1. Identify the most likely root cause based on the incident type, severity, \
 timing, risk level, and evidence.
@@ -118,3 +132,47 @@ timing, risk level, and evidence.
 6. List any uncertainties or missing information.
 
 Respond with a single JSON object matching the required schema."""
+
+
+def _build_introspection_section(context: Any) -> str:
+    """
+    Build the introspection section for the reasoning prompt.
+
+    Explicitly states that trace history is descriptive, not validated
+    ground truth, and must not be treated as evaluation.
+
+    Args:
+        context: Phase 8 IntrospectionContext object.
+
+    Returns:
+        Formatted introspection section string.
+    """
+    lines = [
+        "",
+        "Prior reasoning trace context (descriptive only, NOT ground truth):",
+        "WARNING: The following trace history is descriptive and has NOT been "
+        "validated. Do NOT treat trace frequency as correctness. Use this "
+        "context only as additional evidence to consider, not as validation.",
+        "",
+    ]
+
+    # Add trace IDs consulted
+    trace_ids = getattr(context, "traces_consulted", [])
+    if trace_ids:
+        lines.append(f"Traces consulted: {', '.join(trace_ids[:5])}")
+
+    # Add summary statements
+    summaries = getattr(context, "summary", [])
+    for s in summaries[:5]:
+        lines.append(f"- {s}")
+
+    # Add limitations
+    limitations = getattr(context, "limitations", [])
+    if limitations:
+        lines.append("")
+        lines.append("Limitations:")
+        for lim in limitations:
+            lines.append(f"- {lim}")
+
+    lines.append("")
+    return "\n".join(lines)
