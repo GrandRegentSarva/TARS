@@ -27,6 +27,7 @@ TARS is organized as a layered pipeline. Each layer builds on the one below it:
 | **Phase 5 — Gemini Reasoning** | Analyzes bounded incidents using Google Gemini (via ADK) to produce structured, advisory-only root-cause assessments. Provider-neutral interface with versioned prompts and control-command rejection at the model boundary. | 8004 |
 | **Phase 6 — Phoenix Integration** | Instruments the reasoning layer with OpenTelemetry tracing and exports spans to [Arize Phoenix](https://phoenix.arize.com/). Produces parent-child span hierarchies with OpenInference semantic conventions and configurable content capture (full / metadata / disabled). | — |
 | **Phase 7 — Operational Memory** | Projects bounded facts from Phases 2, 4, and 5 into a Neo4j graph. Connects missions → incidents → root causes → mitigations → outcomes. Answers "Have we seen this before?" with provenance-preserving history queries. | 8005 |
+| **Phase 8 — Phoenix MCP** | Analysis-only self-introspection via Phoenix traces. Lets the reasoning agent inspect its own prior reasoning through 3 read-only MCP tools (search, summary, compare). Fail-open design: Phoenix unavailability never blocks reasoning. 4 content modes, secret redaction, `not_an_evaluation` enforcement. | — |
 
 Each phase has its own FastAPI service, test suite, and configuration. Phases communicate over HTTP — no shared databases, no tight coupling.
 
@@ -118,7 +119,8 @@ TARS/
 |   |-- phase-4-incident-engine.md
 |   |-- phase-5-gemini-reasoning-layer.md
 |   |-- phase-6-phoenix-integration.md
-|   +-- phase-7-neo4j-operational-memory.md
+|   |-- phase-7-neo4j-operational-memory.md
+|   +-- phase-8-phoenix-mcp.md
 |-- docker/                             # Docker setup
 |   |-- Dockerfile.px4-sitl             # PX4 SITL + Gazebo headless
 |   +-- docker-compose.yml              # PX4 SITL + PostgreSQL + Redis + Neo4j
@@ -174,7 +176,7 @@ TARS/
 |       |   |-- config.py              # PhoenixSettings (env-driven)
 |       |   |-- attributes.py          # Stable trace attribute constants
 |       |   +-- tracing.py             # TracerProvider setup, OTLP exporter
-|       +-- phase7/                     # Phase 7 -- Operational Memory
+|       |-- phase7/                     # Phase 7 -- Operational Memory
 |           |-- api.py                  # FastAPI app (port 8005)
 |           |-- config.py              # Environment settings
 |           |-- models.py              # Graph models, enums, request/response
@@ -185,7 +187,15 @@ TARS/
 |           |-- service.py            # Sync + query orchestration
 |           |-- phase2_client.py      # HTTP client for Phase 2 API
 |           |-- phase4_client.py      # HTTP client for Phase 4 API
-|           +-- phase5_client.py      # HTTP client for Phase 5 API
+|           |-- phase5_client.py      # HTTP client for Phase 5 API
+|       +-- phase8/                     # Phase 8 -- Phoenix MCP Self-Introspection
+|           |-- config.py              # PhoenixMCPSettings (env-driven, disabled by default)
+|           |-- models.py              # Pydantic models, secret redaction, safety bounds
+|           |-- phoenix_client.py      # GraphQL client + FakePhoenixTraceClient
+|           |-- summarizer.py          # Raw trace → safe summary conversion
+|           |-- mcp_tools.py           # 3 read-only MCP tool definitions
+|           |-- tool_policy.py         # IntrospectionPolicy decision engine
+|           +-- service.py             # IntrospectionService orchestration
 |-- migrations/                         # Alembic database migrations
 |   |-- env.py
 |   +-- versions/
@@ -232,13 +242,21 @@ TARS/
 |   |   |-- test_config.py              # 31 configuration tests
 |   |   |-- test_tracing.py             # 14 tracing bootstrap tests
 |   |   +-- test_reasoning_traces.py    # 44 reasoning trace tests
-|   +-- phase7/                         # Phase 7 tests
+|   |-- phase7/                         # Phase 7 tests
 |       |-- test_models.py              # Model validation tests
 |       |-- test_mapper.py              # Mapping + deterministic ID tests
 |       |-- test_clients.py             # Upstream HTTP client tests
 |       |-- test_repository.py          # Graph operation tests
 |       |-- test_service.py             # Service orchestration tests
-|       +-- test_api.py                 # API endpoint tests
+|       |-- test_api.py                 # API endpoint tests
+|   +-- phase8/                         # Phase 8 tests (149 tests)
+|       |-- test_config.py              # 18 configuration tests
+|       |-- test_models.py              # 30 model validation tests
+|       |-- test_summarizer.py          # 17 summarization tests
+|       |-- test_phoenix_client.py      # 18 fake client tests
+|       |-- test_mcp_tools.py           # 12 MCP tool tests
+|       |-- test_tool_policy.py         # 9 policy decision tests
+|       +-- test_reasoning_integration.py  # 45 integration tests
 |-- output/                             # Telemetry JSON files
 |-- alembic.ini                         # Alembic configuration
 |-- pytest.ini                          # Pytest configuration
@@ -532,6 +550,30 @@ PYTHONPATH=src .venv/bin/pytest tests/phase5/ -v
 
 ---
 
+## Phase 6 -- Phoenix Integration
+
+Phase 6 instruments the Phase 5 reasoning pipeline with OpenTelemetry tracing and exports spans to [Arize Phoenix](https://phoenix.arize.com/). No separate API — it hooks into Phase 5's service layer.
+
+### Configuration
+
+Set the following in `.env`:
+
+```bash
+PHOENIX_ENABLED=true
+PHOENIX_ENDPOINT=http://localhost:6006
+PHOENIX_PROJECT_NAME=tars-reasoning
+PHOENIX_CONTENT_MODE=full  # full | metadata | disabled
+```
+
+### Run Tests
+
+```bash
+# All Phase 6 tests (no Phoenix required -- tracing is mocked)
+PYTHONPATH=src .venv/bin/pytest tests/phase6/ -v
+```
+
+---
+
 ## Phase 7 -- Operational Memory
 
 Phase 7 projects bounded facts from Phases 2, 4, and 5 into a Neo4j graph database. It connects missions → incidents → root causes → mitigations → outcomes and answers "Have we seen this before?" with provenance-preserving history queries.
@@ -631,6 +673,91 @@ PYTHONPATH=src .venv/bin/pytest tests/phase7/ -v
 PYTHONPATH=src .venv/bin/pytest tests/phase7/test_models.py tests/phase7/test_mapper.py -v
 PYTHONPATH=src .venv/bin/pytest tests/phase7/test_clients.py tests/phase7/test_repository.py -v
 PYTHONPATH=src .venv/bin/pytest tests/phase7/test_service.py tests/phase7/test_api.py -v
+```
+
+---
+
+## Phase 8 -- Phoenix MCP Self-Introspection
+
+Phase 8 adds analysis-only trace introspection to the reasoning pipeline. The reasoning agent can inspect its own prior reasoning traces through Phoenix, using 3 read-only MCP tools. This is **not** an evaluation layer — all outputs carry `not_an_evaluation=True` and explicit limitation warnings.
+
+### Design Principles
+
+- **Read-only**: No trace creation, modification, or evaluation scores
+- **Fail-open**: Phoenix unavailability never blocks reasoning — returns empty context
+- **Bounded**: Max 10 traces per query, 2000-char summaries, 5s query timeout
+- **Safe**: Secret redaction on all summaries, no raw telemetry exposure
+- **Opt-in**: Disabled by default, requires both config flag and per-request flag
+
+### Configuration
+
+```bash
+# Enable in .env
+PHOENIX_MCP_ENABLED=true
+PHOENIX_MCP_CONTENT_MODE=summary          # metadata | summary | full_dev | disabled
+PHOENIX_MCP_GRAPHQL_ENDPOINT=http://localhost:6006/graphql
+PHOENIX_MCP_MAX_TRACES=10
+PHOENIX_MCP_MAX_SUMMARY_CHARS=2000
+PHOENIX_MCP_QUERY_TIMEOUT_S=5.0
+PHOENIX_MCP_REDACT_SECRETS=true
+PHOENIX_MCP_REQUIRE_REQUEST_FLAG=true     # Require use_introspection=true per request
+```
+
+### MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `search_traces` | Find prior reasoning traces by mission_id, incident_type, root_cause, outcome, time range |
+| `get_trace_summary` | Get a safe summary of a specific trace (redacted, truncated, no raw content) |
+| `compare_traces` | Compare 2–5 traces, producing descriptive observations (never evaluative scores) |
+
+### Using Introspection in Analysis
+
+```bash
+# Analyze with introspection enabled (requires PHOENIX_MCP_ENABLED=true)
+curl -X POST http://localhost:8004/api/v1/reasoning/analyze/mission_001/inc_abc123 \
+  -H "Content-Type: application/json" \
+  -d '{"use_introspection": true}'
+```
+
+The response includes introspection metadata when traces are found:
+
+```json
+{
+  "introspection_used": true,
+  "introspection_trace_ids": ["trace_abc", "trace_def"],
+  "introspection_summary": "Consulted 2 prior traces for similar incidents"
+}
+```
+
+### Content Modes
+
+| Mode | What's Included |
+|------|----------------|
+| `disabled` | Introspection completely off |
+| `metadata` | Trace IDs, timestamps, incident types — no reasoning content |
+| `summary` | Metadata + redacted summaries and stage info |
+| `full_dev` | Everything including raw content (development only) |
+
+### Health Check
+
+```bash
+# Phoenix MCP status is included in the Phase 5 health endpoint
+curl http://localhost:8004/health
+# Response includes: "phoenix_mcp": "ok" | "disabled" | "unavailable"
+```
+
+### Run Tests
+
+```bash
+# All Phase 8 tests (no Phoenix required -- uses FakePhoenixTraceClient)
+PYTHONPATH=src .venv/bin/pytest tests/phase8/ -v
+
+# Individual test modules
+PYTHONPATH=src .venv/bin/pytest tests/phase8/test_config.py tests/phase8/test_models.py -v
+PYTHONPATH=src .venv/bin/pytest tests/phase8/test_summarizer.py tests/phase8/test_phoenix_client.py -v
+PYTHONPATH=src .venv/bin/pytest tests/phase8/test_mcp_tools.py tests/phase8/test_tool_policy.py -v
+PYTHONPATH=src .venv/bin/pytest tests/phase8/test_reasoning_integration.py -v
 ```
 
 ---
@@ -807,6 +934,21 @@ Edit `.env` or set environment variables:
 | `MEMORY_QUERY_DEFAULT_LIMIT` | `20` | Default result limit for queries |
 | `MEMORY_QUERY_MAX_LIMIT` | `100` | Maximum result limit for queries |
 
+### Phase 8
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PHOENIX_MCP_ENABLED` | `false` | Enable Phoenix MCP self-introspection |
+| `PHOENIX_MCP_CONTENT_MODE` | `summary` | Content capture: `metadata`, `summary`, `full_dev`, `disabled` |
+| `PHOENIX_MCP_GRAPHQL_ENDPOINT` | `http://localhost:6006/graphql` | Phoenix GraphQL endpoint |
+| `PHOENIX_MCP_MAX_TRACES` | `10` | Maximum traces per query |
+| `PHOENIX_MCP_MAX_SUMMARY_CHARS` | `2000` | Maximum summary length |
+| `PHOENIX_MCP_QUERY_TIMEOUT_S` | `5.0` | Query timeout in seconds |
+| `PHOENIX_MCP_CACHE_TTL_S` | `300` | Cache TTL in seconds |
+| `PHOENIX_MCP_REDACT_SECRETS` | `true` | Redact secrets from summaries |
+| `PHOENIX_MCP_ALLOWED_TOOLS` | `search_traces,get_trace_summary,compare_traces` | Allowed MCP tools |
+| `PHOENIX_MCP_REQUIRE_REQUEST_FLAG` | `true` | Require per-request `use_introspection` flag |
+
 ---
 
 ## Hardware Notes
@@ -831,8 +973,8 @@ Gazebo runs in **headless mode** (no 3D rendering) to fit within RAM constraints
 | 4 | Incident Engine (Rules + Statistical Detection) | ✅ Done |
 | 5 | Gemini Reasoning Layer (Google ADK) | ✅ Done |
 | 6 | Phoenix Integration (OpenInference Tracing) | ✅ Done |
-| 7 | Neo4j Operational Memory | ✅ Current |
-| 8 | Phoenix MCP (Self-Introspection) | Planned |
+| 7 | Neo4j Operational Memory | ✅ Done |
+| 8 | Phoenix MCP (Self-Introspection) | ✅ Current |
 | 9 | Evaluation Layer | Planned |
 | 10 | Learning Engine | Planned |
 | 11 | Knowledge Validation | Planned |
