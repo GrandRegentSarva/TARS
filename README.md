@@ -28,6 +28,7 @@ TARS is organized as a layered pipeline. Each layer builds on the one below it:
 | **Phase 6 — Phoenix Integration** | Instruments the reasoning layer with OpenTelemetry tracing and exports spans to [Arize Phoenix](https://phoenix.arize.com/). Produces parent-child span hierarchies with OpenInference semantic conventions and configurable content capture (full / metadata / disabled). | — |
 | **Phase 7 — Operational Memory** | Projects bounded facts from Phases 2, 4, and 5 into a Neo4j graph. Connects missions → incidents → root causes → mitigations → outcomes. Answers "Have we seen this before?" with provenance-preserving history queries. | 8005 |
 | **Phase 8 — Phoenix MCP** | Analysis-only self-introspection via Phoenix traces. Lets the reasoning agent inspect its own prior reasoning through 3 read-only MCP tools (search, summary, compare). Fail-open design: Phoenix unavailability never blocks reasoning. 4 content modes, secret redaction, `not_an_evaluation` enforcement. | — |
+| **Phase 9 — Evaluation Layer** | Measures reasoning quality against bounded ground-truth labels, mission outcomes, and incident facts. Produces durable, inspectable evaluation scores (root-cause accuracy, recommendation quality, consistency, false positives/negatives) without changing operational behavior. | 8006 |
 
 Each phase has its own FastAPI service, test suite, and configuration. Phases communicate over HTTP — no shared databases, no tight coupling.
 
@@ -196,6 +197,20 @@ TARS/
 |           |-- mcp_tools.py           # 3 read-only MCP tool definitions
 |           |-- tool_policy.py         # IntrospectionPolicy decision engine
 |           +-- service.py             # IntrospectionService orchestration
+|       +-- phase9/                     # Phase 9 -- Evaluation Layer
+|           |-- api.py                  # FastAPI app (port 8006)
+|           |-- config.py              # Environment settings + weight validation
+|           |-- models.py              # Evaluation schemas, enums, metric contracts
+|           |-- database.py            # Async SQLAlchemy engine/session
+|           |-- repository.py          # PostgreSQL evaluation persistence
+|           |-- evaluator.py           # Deterministic scoring (root cause, recommendation, consistency)
+|           |-- ground_truth.py        # Multi-source ground-truth resolution
+|           |-- service.py             # Evaluation orchestration
+|           |-- phoenix_exporter.py    # Optional Phoenix eval export
+|           +-- adapters/
+|               |-- phase4_client.py   # Read-only Phase 4 incident client
+|               |-- phase5_client.py   # Read-only Phase 5 reasoning client
+|               +-- phase7_client.py   # Read-only Phase 7 outcome client
 |-- migrations/                         # Alembic database migrations
 |   |-- env.py
 |   +-- versions/
@@ -212,7 +227,8 @@ TARS/
 |   |-- analyze_incident.sh            # Analyze an incident through Phase 5
 |   |-- start_memory_api.sh            # Start Phase 7 Memory API server
 |   |-- sync_mission_memory.sh         # Sync a mission into Neo4j graph
-|   +-- query_similar_incidents.sh     # Query similar historical incidents
+|   |-- query_similar_incidents.sh     # Query similar historical incidents
+|   +-- start_evaluation_api.sh        # Start Phase 9 Evaluation API server
 |-- tests/
 |   |-- phase2/                         # Phase 2 tests
 |   |   |-- test_importer.py
@@ -243,20 +259,29 @@ TARS/
 |   |   |-- test_tracing.py             # 14 tracing bootstrap tests
 |   |   +-- test_reasoning_traces.py    # 44 reasoning trace tests
 |   |-- phase7/                         # Phase 7 tests
+|   |   |-- test_models.py              # Model validation tests
+|   |   |-- test_mapper.py              # Mapping + deterministic ID tests
+|   |   |-- test_clients.py             # Upstream HTTP client tests
+|   |   |-- test_repository.py          # Graph operation tests
+|   |   |-- test_service.py             # Service orchestration tests
+|   |   +-- test_api.py                 # API endpoint tests
+|   |-- phase8/                         # Phase 8 tests (149 tests)
+|   |   |-- test_config.py              # 18 configuration tests
+|   |   |-- test_models.py              # 30 model validation tests
+|   |   |-- test_summarizer.py          # 17 summarization tests
+|   |   |-- test_phoenix_client.py      # 18 fake client tests
+|   |   |-- test_mcp_tools.py           # 12 MCP tool tests
+|   |   |-- test_tool_policy.py         # 9 policy decision tests
+|   |   +-- test_reasoning_integration.py  # 45 integration tests
+|   +-- phase9/                         # Phase 9 tests
+|       |-- test_config.py              # Configuration validation tests
 |       |-- test_models.py              # Model validation tests
-|       |-- test_mapper.py              # Mapping + deterministic ID tests
-|       |-- test_clients.py             # Upstream HTTP client tests
-|       |-- test_repository.py          # Graph operation tests
+|       |-- test_evaluator.py           # Deterministic scoring tests
+|       |-- test_ground_truth.py        # Ground-truth resolution tests
+|       |-- test_repository.py          # Persistence tests
 |       |-- test_service.py             # Service orchestration tests
-|       |-- test_api.py                 # API endpoint tests
-|   +-- phase8/                         # Phase 8 tests (149 tests)
-|       |-- test_config.py              # 18 configuration tests
-|       |-- test_models.py              # 30 model validation tests
-|       |-- test_summarizer.py          # 17 summarization tests
-|       |-- test_phoenix_client.py      # 18 fake client tests
-|       |-- test_mcp_tools.py           # 12 MCP tool tests
-|       |-- test_tool_policy.py         # 9 policy decision tests
-|       +-- test_reasoning_integration.py  # 45 integration tests
+|       |-- test_phoenix_exporter.py    # Phoenix export tests
+|       +-- test_api.py                 # API endpoint tests
 |-- output/                             # Telemetry JSON files
 |-- alembic.ini                         # Alembic configuration
 |-- pytest.ini                          # Pytest configuration
@@ -762,6 +787,117 @@ PYTHONPATH=src .venv/bin/pytest tests/phase8/test_reasoning_integration.py -v
 
 ---
 
+## Phase 9 -- Evaluation Layer
+
+Phase 9 measures the quality of reasoning outputs against bounded ground-truth labels, mission outcomes, and incident facts. It produces durable, inspectable evaluation scores without changing operational behavior.
+
+### Design Principles
+
+- **Analysis-only**: Never calls flight-control APIs, invokes Gemini, or mutates upstream records
+- **Bounded metrics**: All scores are [0.0, 1.0], all results carry `advisory_only=True`
+- **Explicit evidence**: Missing ground truth produces `insufficient_evidence`, not invented scores
+- **Fail-open**: Phoenix and Phase 7 are optional; their unavailability does not fail evaluation
+- **Deterministic**: All scoring uses versioned aliases and families, no LLM calls during evaluation
+
+### 1. Start PostgreSQL and Run Migrations
+
+```bash
+docker compose -f docker/docker-compose.yml up postgres -d
+PYTHONPATH=src .venv/bin/alembic upgrade head
+```
+
+### 2. Start the Evaluation API
+
+```bash
+./scripts/start_evaluation_api.sh
+
+# API docs available at http://localhost:8006/docs
+# Health check at http://localhost:8006/health
+```
+
+### 3. Create a Ground-Truth Label
+
+```bash
+curl -X POST http://localhost:8006/api/v1/evaluations/labels \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mission_id": "mission_20260618_120000",
+    "incident_id": "inc_abc123",
+    "root_cause": "gps_interference",
+    "preferred_mitigation": "switch_to_visual_odometry",
+    "outcome": "recovered",
+    "source": "operator_label",
+    "labeled_by": "operator"
+  }'
+```
+
+### 4. Evaluate a Reasoning Result
+
+```bash
+# With inline ground truth
+curl -X POST http://localhost:8006/api/v1/evaluations/evaluate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mission_id": "mission_20260618_120000",
+    "incident_id": "inc_abc123",
+    "reasoning_id": "reason_abc123",
+    "ground_truth": {
+      "root_cause": "gps_interference",
+      "preferred_mitigation": "switch_to_visual_odometry",
+      "outcome": "recovered"
+    }
+  }'
+
+# Using stored labels (no inline ground truth needed)
+curl -X POST http://localhost:8006/api/v1/evaluations/evaluate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mission_id": "mission_20260618_120000",
+    "incident_id": "inc_abc123",
+    "reasoning_id": "reason_abc123"
+  }'
+```
+
+### 5. Query Evaluations
+
+```bash
+# Get a specific evaluation
+curl http://localhost:8006/api/v1/evaluations/eval_abc123
+
+# Get all evaluations for a mission
+curl http://localhost:8006/api/v1/evaluations/mission/mission_20260618_120000
+
+# Get all evaluations for a reasoning result
+curl http://localhost:8006/api/v1/evaluations/reasoning/reason_abc123
+```
+
+### 6. Batch Evaluate
+
+```bash
+curl -X POST http://localhost:8006/api/v1/evaluations/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "targets": [
+      {"mission_id": "mission_001", "incident_id": "inc_001", "reasoning_id": "reason_001"},
+      {"mission_id": "mission_001", "incident_id": "inc_002", "reasoning_id": "reason_002"}
+    ]
+  }'
+```
+
+### 7. Run Tests
+
+```bash
+# All Phase 9 tests (no PostgreSQL, Phoenix, Gemini, Neo4j, or PX4 required)
+PYTHONPATH=src .venv/bin/pytest tests/phase9/ -v
+
+# Individual test modules
+PYTHONPATH=src .venv/bin/pytest tests/phase9/test_config.py tests/phase9/test_models.py -v
+PYTHONPATH=src .venv/bin/pytest tests/phase9/test_evaluator.py tests/phase9/test_ground_truth.py -v
+PYTHONPATH=src .venv/bin/pytest tests/phase9/test_service.py tests/phase9/test_api.py -v
+```
+
+---
+
 ## Telemetry Output Format
 
 Each mission produces a JSON file in `output/`:
@@ -949,6 +1085,26 @@ Edit `.env` or set environment variables:
 | `PHOENIX_MCP_ALLOWED_TOOLS` | `search_traces,get_trace_summary,compare_traces` | Allowed MCP tools |
 | `PHOENIX_MCP_REQUIRE_REQUEST_FLAG` | `true` | Require per-request `use_introspection` flag |
 
+### Phase 9
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EVALUATION_ENABLED` | `true` | Enable the Phase 9 evaluation service |
+| `EVALUATION_DATABASE_URL` | `postgresql+asyncpg://tars:tars@localhost:5432/tars` | PostgreSQL connection string |
+| `EVALUATION_VERSION` | `v1.0` | Evaluator version stamped on results |
+| `EVALUATION_API_HOST` | `0.0.0.0` | Evaluation API server host |
+| `EVALUATION_API_PORT` | `8006` | Evaluation API server port |
+| `EVALUATION_BATCH_LIMIT` | `50` | Maximum targets per batch request |
+| `EVALUATION_CONSISTENCY_MIN_CASES` | `3` | Minimum cases for consistency scoring |
+| `EVALUATION_SIMILARITY_LIMIT` | `20` | Maximum similar cases to compare |
+| `EVALUATION_EXPORT_PHOENIX` | `false` | Export eval scores to Phoenix |
+| `EVALUATION_REQUIRE_OPERATOR_LABEL` | `false` | Require explicit operator labels |
+| `EVALUATION_ROOT_CAUSE_WEIGHT` | `0.40` | Overall score root-cause weight |
+| `EVALUATION_RECOMMENDATION_WEIGHT` | `0.35` | Overall score recommendation weight |
+| `EVALUATION_CONSISTENCY_WEIGHT` | `0.15` | Overall score consistency weight |
+| `EVALUATION_FALSE_POSITIVE_WEIGHT` | `0.05` | Overall score false-positive penalty |
+| `EVALUATION_FALSE_NEGATIVE_WEIGHT` | `0.05` | Overall score false-negative penalty |
+
 ---
 
 ## Hardware Notes
@@ -974,8 +1130,8 @@ Gazebo runs in **headless mode** (no 3D rendering) to fit within RAM constraints
 | 5 | Gemini Reasoning Layer (Google ADK) | ✅ Done |
 | 6 | Phoenix Integration (OpenInference Tracing) | ✅ Done |
 | 7 | Neo4j Operational Memory | ✅ Done |
-| 8 | Phoenix MCP (Self-Introspection) | ✅ Current |
-| 9 | Evaluation Layer | Planned |
+| 8 | Phoenix MCP (Self-Introspection) | ✅ Done |
+| 9 | Evaluation Layer (Reasoning Quality Metrics) | ✅ Current |
 | 10 | Learning Engine | Planned |
 | 11 | Knowledge Validation | Planned |
 | 12 | Adaptive Recommendation Engine | Planned |
