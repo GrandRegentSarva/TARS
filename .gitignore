@@ -40,5 +40,8 @@ Thumbs.db
 # Docker
 docker/.env
 
+# AI rules (local-only, not tracked)
+CONTRIBUTING_AI.md
+
 # Logs
 *.log
