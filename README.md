@@ -29,6 +29,7 @@ TARS is organized as a layered pipeline. Each layer builds on the one below it:
 | **Phase 7 — Operational Memory** | Projects bounded facts from Phases 2, 4, and 5 into a Neo4j graph. Connects missions → incidents → root causes → mitigations → outcomes. Answers "Have we seen this before?" with provenance-preserving history queries. | 8005 |
 | **Phase 8 — Phoenix MCP** | Analysis-only self-introspection via Phoenix traces. Lets the reasoning agent inspect its own prior reasoning through 3 read-only MCP tools (search, summary, compare). Fail-open design: Phoenix unavailability never blocks reasoning. 4 content modes, secret redaction, `not_an_evaluation` enforcement. | — |
 | **Phase 9 — Evaluation Layer** | Measures reasoning quality against bounded ground-truth labels, mission outcomes, and incident facts. Produces durable, inspectable evaluation scores (root-cause accuracy, recommendation quality, consistency, false positives/negatives) without changing operational behavior. | 8006 |
+| **Phase 10 — Learning Engine** | Turns evaluated mission history into candidate operational knowledge. Aggregates Phase 9 evaluations, Phase 7 operational memory, and safe trace metadata into candidate knowledge with evidence, confidence, and provenance. Candidate knowledge is not truth — it is input to Phase 11 validation. | 8007 |
 
 Each phase has its own FastAPI service, test suite, and configuration. Phases communicate over HTTP — no shared databases, no tight coupling.
 
@@ -211,6 +212,21 @@ TARS/
 |               |-- phase4_client.py   # Read-only Phase 4 incident client
 |               |-- phase5_client.py   # Read-only Phase 5 reasoning client
 |               +-- phase7_client.py   # Read-only Phase 7 outcome client
+|       +-- phase10/                    # Phase 10 -- Learning Engine
+|           |-- api.py                  # FastAPI app (port 8007)
+|           |-- config.py              # Environment settings + weight validation
+|           |-- models.py              # Learning schemas, enums, candidate contracts
+|           |-- database.py            # Async SQLAlchemy engine/session
+|           |-- repository.py          # PostgreSQL candidate knowledge persistence
+|           |-- service.py             # Learning run orchestration
+|           |-- evidence_loader.py     # Phase 9 + Phase 7 evidence merge
+|           |-- pattern_miner.py       # Deterministic pattern grouping
+|           |-- scorer.py              # Versioned confidence scoring
+|           |-- statement_templates.py # Cautious association language templates
+|           +-- adapters/
+|               |-- phase9_client.py   # Read-only Phase 9 evaluation client
+|               |-- phase7_client.py   # Read-only Phase 7 memory client
+|               +-- phoenix_client.py  # Read-only Phoenix trace metadata client
 |-- migrations/                         # Alembic database migrations
 |   |-- env.py
 |   +-- versions/
@@ -228,7 +244,8 @@ TARS/
 |   |-- start_memory_api.sh            # Start Phase 7 Memory API server
 |   |-- sync_mission_memory.sh         # Sync a mission into Neo4j graph
 |   |-- query_similar_incidents.sh     # Query similar historical incidents
-|   +-- start_evaluation_api.sh        # Start Phase 9 Evaluation API server
+|   |-- start_evaluation_api.sh        # Start Phase 9 Evaluation API server
+|   +-- start_learning_api.sh          # Start Phase 10 Learning API server
 |-- tests/
 |   |-- phase2/                         # Phase 2 tests
 |   |   |-- test_importer.py
@@ -273,14 +290,23 @@ TARS/
 |   |   |-- test_mcp_tools.py           # 12 MCP tool tests
 |   |   |-- test_tool_policy.py         # 9 policy decision tests
 |   |   +-- test_reasoning_integration.py  # 45 integration tests
-|   +-- phase9/                         # Phase 9 tests
+|   |-- phase9/                         # Phase 9 tests
+|   |   |-- test_config.py              # Configuration validation tests
+|   |   |-- test_models.py              # Model validation tests
+|   |   |-- test_evaluator.py           # Deterministic scoring tests
+|   |   |-- test_ground_truth.py        # Ground-truth resolution tests
+|   |   |-- test_repository.py          # Persistence tests
+|   |   |-- test_service.py             # Service orchestration tests
+|   |   |-- test_phoenix_exporter.py    # Phoenix export tests
+|   |   +-- test_api.py                 # API endpoint tests
+|   +-- phase10/                        # Phase 10 tests
 |       |-- test_config.py              # Configuration validation tests
-|       |-- test_models.py              # Model validation tests
-|       |-- test_evaluator.py           # Deterministic scoring tests
-|       |-- test_ground_truth.py        # Ground-truth resolution tests
+|       |-- test_models.py              # Model + enum validation tests
+|       |-- test_evidence_loader.py     # Evidence merge + dedup tests
+|       |-- test_pattern_miner.py       # Deterministic pattern grouping tests
+|       |-- test_scorer.py              # Confidence scoring tests
 |       |-- test_repository.py          # Persistence tests
 |       |-- test_service.py             # Service orchestration tests
-|       |-- test_phoenix_exporter.py    # Phoenix export tests
 |       +-- test_api.py                 # API endpoint tests
 |-- output/                             # Telemetry JSON files
 |-- alembic.ini                         # Alembic configuration
@@ -898,6 +924,106 @@ PYTHONPATH=src .venv/bin/pytest tests/phase9/test_service.py tests/phase9/test_a
 
 ---
 
+## Phase 10 -- Learning Engine
+
+Phase 10 mines Phase 9 evaluation records, Phase 7 operational memory, and safe trace metadata for repeated patterns. It produces **candidate knowledge** with evidence, confidence, and provenance. Candidate knowledge is NOT truth — it is input to Phase 11 validation.
+
+### Design Principles
+
+- **Deterministic only** — no Gemini, no LLM calls
+- **advisory_only=True** on every candidate, always
+- **Cautious language** — "is associated with", never "causes" or "fixes"
+- **No validated status** — candidates are `proposed`, `superseded`, `retired`, or `rejected`
+- **No flight-control impact** — candidates never change recommendations
+
+### 1. Start PostgreSQL and Run Migrations
+
+```bash
+docker compose -f docker/docker-compose.yml up postgres -d
+PYTHONPATH=src .venv/bin/alembic upgrade head
+```
+
+### 2. Start the Learning API
+
+```bash
+scripts/start_learning_api.sh
+# Or manually:
+PYTHONPATH=src .venv/bin/uvicorn tars.phase10.api:app --host 0.0.0.0 --port 8007
+```
+
+### 3. Trigger a Learning Run
+
+```bash
+# Full learning run (mines all candidate types)
+curl -X POST http://localhost:8007/api/v1/learning/runs \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Dry run (no persistence, returns candidates without saving)
+curl -X POST http://localhost:8007/api/v1/learning/runs \
+  -H "Content-Type: application/json" \
+  -d '{"dry_run": true}'
+
+# Filter by mission
+curl -X POST http://localhost:8007/api/v1/learning/runs \
+  -H "Content-Type: application/json" \
+  -d '{"mission_ids": ["mission_001", "mission_002"]}'
+
+# Filter by candidate type
+curl -X POST http://localhost:8007/api/v1/learning/runs \
+  -H "Content-Type: application/json" \
+  -d '{"candidate_types": ["mitigation_effectiveness", "root_cause_pattern"]}'
+```
+
+### 4. Query Learning Runs
+
+```bash
+# Get a specific learning run
+curl http://localhost:8007/api/v1/learning/runs/{run_id}
+```
+
+### 5. Browse Candidates
+
+```bash
+# List all proposed candidates
+curl "http://localhost:8007/api/v1/learning/candidates?status=proposed"
+
+# Filter by type
+curl "http://localhost:8007/api/v1/learning/candidates?candidate_type=mitigation_effectiveness"
+
+# Paginate
+curl "http://localhost:8007/api/v1/learning/candidates?limit=10&offset=20"
+
+# Get a specific candidate
+curl http://localhost:8007/api/v1/learning/candidates/{candidate_id}
+
+# Get evidence for a candidate
+curl http://localhost:8007/api/v1/learning/candidates/{candidate_id}/evidence
+```
+
+### 6. Retire a Candidate
+
+```bash
+curl -X POST http://localhost:8007/api/v1/learning/candidates/{candidate_id}/retire \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "Superseded by newer analysis"}'
+```
+
+### 7. Run Tests
+
+```bash
+# All Phase 10 tests (no PostgreSQL, Phoenix, Gemini, Neo4j, or PX4 required)
+PYTHONPATH=src .venv/bin/pytest tests/phase10/ -v
+
+# Individual test modules
+PYTHONPATH=src .venv/bin/pytest tests/phase10/test_config.py tests/phase10/test_models.py -v
+PYTHONPATH=src .venv/bin/pytest tests/phase10/test_evidence_loader.py tests/phase10/test_pattern_miner.py -v
+PYTHONPATH=src .venv/bin/pytest tests/phase10/test_scorer.py tests/phase10/test_repository.py -v
+PYTHONPATH=src .venv/bin/pytest tests/phase10/test_service.py tests/phase10/test_api.py -v
+```
+
+---
+
 ## Telemetry Output Format
 
 Each mission produces a JSON file in `output/`:
@@ -1105,6 +1231,30 @@ Edit `.env` or set environment variables:
 | `EVALUATION_FALSE_POSITIVE_WEIGHT` | `0.05` | Overall score false-positive penalty |
 | `EVALUATION_FALSE_NEGATIVE_WEIGHT` | `0.05` | Overall score false-negative penalty |
 
+### Phase 10
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LEARNING_ENABLED` | `true` | Enable the Phase 10 learning service |
+| `LEARNING_DATABASE_URL` | `postgresql+asyncpg://tars:tars@localhost:5432/tars` | PostgreSQL connection string |
+| `LEARNING_VERSION` | `v1.0` | Learning engine version stamped on candidates |
+| `LEARNING_API_HOST` | `0.0.0.0` | Learning API server host |
+| `LEARNING_API_PORT` | `8007` | Learning API server port |
+| `LEARNING_MIN_EVALUATED_CASES` | `5` | Minimum evaluated cases to form a pattern |
+| `LEARNING_MIN_DISTINCT_MISSIONS` | `3` | Minimum distinct missions for diversity |
+| `LEARNING_MIN_CONFIDENCE` | `0.60` | Minimum confidence to emit a candidate |
+| `LEARNING_MIN_SUCCESS_RATE` | `0.70` | Minimum success rate for mitigation patterns |
+| `LEARNING_MAX_FALSE_POSITIVE_RATE` | `0.20` | Maximum false-positive rate allowed |
+| `LEARNING_SCORING_SUPPORT_WEIGHT` | `0.35` | Confidence score support weight |
+| `LEARNING_SCORING_OUTCOME_WEIGHT` | `0.25` | Confidence score outcome weight |
+| `LEARNING_SCORING_EVALUATION_WEIGHT` | `0.20` | Confidence score evaluation weight |
+| `LEARNING_SCORING_DIVERSITY_WEIGHT` | `0.10` | Confidence score diversity weight |
+| `LEARNING_SCORING_CONTRADICTION_WEIGHT` | `0.10` | Confidence score contradiction penalty weight |
+| `PHASE9_API_URL` | `http://localhost:8006` | Phase 9 API base URL |
+| `PHASE7_API_URL` | `http://localhost:8005` | Phase 7 API base URL |
+| `LEARNING_TRACE_METADATA_ENABLED` | `false` | Enable Phoenix trace metadata enrichment |
+| `PHOENIX_BASE_URL` | `http://localhost:6006` | Phoenix API base URL |
+
 ---
 
 ## Hardware Notes
@@ -1131,8 +1281,8 @@ Gazebo runs in **headless mode** (no 3D rendering) to fit within RAM constraints
 | 6 | Phoenix Integration (OpenInference Tracing) | ✅ Done |
 | 7 | Neo4j Operational Memory | ✅ Done |
 | 8 | Phoenix MCP (Self-Introspection) | ✅ Done |
-| 9 | Evaluation Layer (Reasoning Quality Metrics) | ✅ Current |
-| 10 | Learning Engine | Planned |
+| 9 | Evaluation Layer (Reasoning Quality Metrics) | ✅ Done |
+| 10 | Learning Engine | ✅ Current |
 | 11 | Knowledge Validation | Planned |
 | 12 | Adaptive Recommendation Engine | Planned |
 
